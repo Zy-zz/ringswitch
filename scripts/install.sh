@@ -7,4 +7,6 @@ if pgrep -x RingSwitch >/dev/null; then
   exit 1
 fi
 ditto dist/RingSwitch.app /Applications/RingSwitch.app
+rm -rf dist
+cargo clean
 open /Applications/RingSwitch.app

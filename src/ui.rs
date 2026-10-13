@@ -14,6 +14,7 @@ use objc::{
     runtime::{Class, Object, Sel},
     sel, sel_impl,
 };
+use std::os::fd::AsRawFd;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -23,6 +24,33 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+fn instance_lock() -> Result<Option<std::fs::File>, String> {
+    let directory = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join("Library/Application Support/RingSwitch");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("instance.lock"))
+        .map_err(|e| e.to_string())?;
+    if unsafe { flock(file.as_raw_fd(), 6) } == 0 {
+        Ok(Some(file))
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(error.to_string())
+        }
+    }
+}
 
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
 struct Radial {
@@ -133,7 +161,8 @@ extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
         if std::ptr::eq(view,app.preview_view) {
             fill(b,color(0.25,0.57,1.,0.14),12.);outline(rect(2.,2.,b.size.width-4.,b.size.height-4.),color(0.40,0.72,1.,0.92),10.,3.);return;
         }
-        let white=color(0.95,0.97,1.,1.);
+        let white:id=msg_send![class!(NSColor),labelColor];
+        let secondary:id=msg_send![class!(NSColor),secondaryLabelColor];
         if app.radial.is_some()||(app.demo&&!app.switching) {
             let selected=app.radial.as_ref().and_then(|r|r.selected).or(if app.demo{Some(Layout::Top)}else{None});
             let center=NSPoint::new(90.,105.);
@@ -142,29 +171,30 @@ extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
                 let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:58. startAngle:a-22.3 endAngle:a+22.3];
                 let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:43. startAngle:a+22.3 endAngle:a-22.3 clockwise:YES];
                 let _:()=msg_send![path,closePath];
-                let c=if selected==Some(*layout)||selected==Some(Layout::Maximize){color(0.30,0.63,1.,0.98)}else{color(0.13,0.16,0.22,0.90)};
+                let c=if selected==Some(*layout)||selected==Some(Layout::Maximize){color(0.25,0.57,1.,0.62)}else{color(1.,1.,1.,0.16)};
                 let _:()=msg_send![c,set];let _:()=msg_send![path,fill];
             }
-            fill(rect(56.,77.,68.,56.),color(0.10,0.13,0.19,0.92),12.);
+            fill(rect(56.,77.,68.,56.),color(1.,1.,1.,0.10),12.);
             layout_symbol(selected.unwrap_or(Layout::Maximize),rect(68.,91.,44.,28.));
-            let label=selected.map(|s|s.label()).unwrap_or("移动选择 · Esc 取消");
-            fill(rect(12.,12.,156.,27.),color(0.10,0.13,0.19,0.92),8.);
-            text(label,rect(28.,16.,136.,19.),12.,white);return;
+            let label=selected.map(|s|s.label()).unwrap_or("移动选择");
+
+            text(label,rect(if selected.is_some(){72.}else{66.},20.,100.,19.),12.,white);return;
         }
-        fill(b,color(0.12,0.14,0.19,0.96),18.);
+        outline(rect(0.5,0.5,b.size.width-1.,b.size.height-1.),color(1.,1.,1.,0.30),26.,1.);
         if !app.switching {text(&app.message,rect(24.,25.,b.size.width-48.,55.),15.,white);return;}
         let config=*app.controls.config.lock().unwrap();
-        text("窗口",rect(22.,b.size.height-36.,180.,22.),15.,white);
-        text(&format!("{} / {}",app.selected+1,app.windows.len()),rect(b.size.width-80.,b.size.height-34.,65.,20.),12.,color(0.65,0.69,0.78,1.));
+        let heading=app.windows.first().map(|w|w.app.as_str()).unwrap_or("当前软件");
+        text(heading,rect(24.,b.size.height-37.,b.size.width-110.,22.),15.,white);
+        text(&format!("{} / {}",app.selected+1,app.windows.len()),rect(b.size.width-80.,b.size.height-34.,65.,20.),12.,secondary);
         let capacity=app.grid.0*app.grid.1;let start=app.selected/capacity*capacity;
         for (position,window) in app.windows.iter().skip(start).take(capacity).enumerate() {
             let index=start+position;let col=position%app.grid.0;let row=position/app.grid.0;
             let x=16.+col as f64*220.;let y=b.size.height-46.-(row+1)as f64*184.;
             let card=rect(x,y,208.,172.);
-            fill(card,if index==app.selected{color(0.20,0.34,0.52,1.)}else{color(0.18,0.20,0.25,1.)},10.);
-            if index==app.selected{outline(rect(x+1.,y+1.,206.,170.),color(0.40,0.72,1.,1.),9.,2.5);}
+            fill(card,if index==app.selected{color(0.34,0.62,1.,0.15)}else{color(1.,1.,1.,0.06)},15.);
+            if index==app.selected{outline(rect(x+1.,y+1.,206.,170.),color(0.30,0.60,1.,0.65),14.,1.4);}
             let preview=rect(x+8.,y+40.,192.,124.);
-            fill(preview,color(0.09,0.10,0.13,1.),6.);
+            fill(preview,color(0.,0.,0.,0.06),9.);
             if let Some(image)=app.thumbnails.get(&window.number) {
                 let iw=CGImageGetWidth(image.0)as f64;let ih=CGImageGetHeight(image.0)as f64;
                 let scale=(192./iw).min(124./ih);let w=iw*scale;let h=ih*scale;
@@ -174,14 +204,14 @@ extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
                 let _:()=msg_send![nsimage,release];
             }else{
                 icon(window.pid,rect(x+80.,y+86.,48.,48.));
-                text(if window.minimized{"已最小化"}else{"窗口预览"},rect(x+69.,y+59.,105.,18.),11.,color(0.55,0.6,0.7,1.));
+                text(if window.minimized{"已最小化"}else{"窗口预览"},rect(x+69.,y+59.,105.,18.),11.,secondary);
             }
             icon(window.pid,rect(x+10.,y+12.,20.,20.));
             text(&shorten(if window.title.is_empty(){&window.app}else{&window.title},24),rect(x+37.,y+18.,163.,19.),12.,white);
-            text(&shorten(&window.app,26),rect(x+37.,y+3.,163.,16.),10.,color(0.65,0.70,0.79,1.));
+            text(if window.minimized{"已最小化"}else{"窗口"},rect(x+37.,y+3.,163.,16.),10.,secondary);
         }
         let hold=config.switch.label();
-        text(&format!("{} · 松开修饰键切换 · Shift 反向 · Esc 取消",hold),rect(22.,12.,b.size.width-44.,22.),11.,color(0.67,0.72,0.80,1.));
+        text(&format!("{} · 松开修饰键切换 · Shift 反向 · Esc 取消",hold),rect(22.,12.,b.size.width-44.,22.),11.,secondary);
     });
     }
 }
@@ -281,7 +311,7 @@ unsafe fn open_url(s: &str) {
     let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
     let _: bool = msg_send![workspace,openURL:url];
 }
-unsafe fn panel(view_class: &Class) -> (id, id) {
+unsafe fn panel(view_class: &Class, glass: bool) -> (id, id) {
     let p: id = msg_send![class!(NSPanel), alloc];
     let p: id = msg_send![p,initWithContentRect:rect(0.,0.,300.,300.) styleMask:128usize backing:2usize defer:NO];
     let _: () = msg_send![p,setOpaque:NO];
@@ -294,12 +324,46 @@ unsafe fn panel(view_class: &Class) -> (id, id) {
     let _: () = msg_send![p,setReleasedWhenClosed:NO];
     let view: id = msg_send![view_class, alloc];
     let view: id = msg_send![view,initWithFrame:rect(0.,0.,300.,300.)];
-    let _: () = msg_send![p,setContentView:view];
+    let _: () = msg_send![view,setAutoresizingMask:18usize];
+    if glass {
+        let material: id;
+        if let Some(glass_class) = Class::get("NSGlassEffectView") {
+            let allocated: id = msg_send![glass_class, alloc];
+            material = msg_send![allocated,initWithFrame:rect(0.,0.,300.,300.)];
+            let _: () = msg_send![material,setStyle:0isize];
+            let _: () = msg_send![material,setCornerRadius:26.0f64];
+            let _: () = msg_send![material,setContentView:view];
+        } else {
+            let allocated: id = msg_send![class!(NSVisualEffectView), alloc];
+            material = msg_send![allocated,initWithFrame:rect(0.,0.,300.,300.)];
+            let _: () = msg_send![material,setMaterial:13isize];
+            let _: () = msg_send![material,setBlendingMode:0isize];
+            let _: () = msg_send![material,setState:1isize];
+            let _: () = msg_send![material,setWantsLayer:YES];
+            let layer: id = msg_send![material, layer];
+            let _: () = msg_send![layer,setCornerRadius:26.0f64];
+            let _: () = msg_send![layer,setMasksToBounds:YES];
+            let _: () = msg_send![material,addSubview:view];
+        }
+        let _: () = msg_send![p,setContentView:material];
+        let _: () = msg_send![material, release];
+    } else {
+        let _: () = msg_send![p,setContentView:view];
+    }
+    let _: () = msg_send![p,setHasShadow:if glass{YES}else{NO}];
     (p, view)
 }
 
 impl App {
     unsafe fn show(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        let radius = if w == 180. && h == 180. { 90. } else { 26. };
+        let material: id = msg_send![self.panel, contentView];
+        if Class::get("NSGlassEffectView").is_some() {
+            let _: () = msg_send![material,setCornerRadius:radius];
+        } else {
+            let layer: id = msg_send![material, layer];
+            let _: () = msg_send![layer,setCornerRadius:radius];
+        }
         let _: () = msg_send![self.panel,setFrame:rect(x,primary_height()-y-h,w,h) display:YES];
         let _: () = msg_send![self.view,setNeedsDisplay:YES];
         let _: () = msg_send![self.panel, orderFrontRegardless];
@@ -372,9 +436,13 @@ impl App {
     unsafe fn show_switcher(&mut self) {
         let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         let s = screen_at(&screens(), mouse.x, primary_height() - mouse.y).unwrap();
-        let cols = (((s.w - 32.) / 220.) as usize)
-            .clamp(1, 4)
-            .min(self.windows.len().max(1));
+        let cols = (((s.w - 32.) / 220.) as usize).clamp(1, 4).min(
+            if [5, 6, 9].contains(&self.windows.len()) {
+                3
+            } else {
+                self.windows.len().clamp(1, 4)
+            },
+        );
         let rows = (((s.h - 86.) / 184.) as usize)
             .clamp(1, 3)
             .min(self.windows.len().div_ceil(cols).max(1));
@@ -402,7 +470,7 @@ impl App {
                     self.session = self.session.wrapping_add(1);
                     self.thumbnails.clear();
                     self.requested.clear();
-                    self.windows = windows();
+                    self.windows = current_app_windows();
                     self.windows.sort_by_key(|w| {
                         self.mru
                             .iter()
@@ -594,6 +662,24 @@ pub unsafe fn run() {
         pool.drain();
         return;
     }
+    let _instance_lock = if args
+        .iter()
+        .any(|a| a.starts_with("--demo") || a == "--qa-windows")
+    {
+        None
+    } else {
+        match instance_lock() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                eprintln!("RingSwitch is already running");
+                return;
+            }
+            Err(e) => {
+                eprintln!("RingSwitch: {e}");
+                return;
+            }
+        }
+    };
     let mut view = ClassDecl::new("RingSwitchCanvas", class!(NSView)).unwrap();
     view.add_method(sel!(drawRect:), draw as extern "C" fn(&Object, Sel, NSRect));
     let view_class = view.register();
@@ -602,8 +688,8 @@ pub unsafe fn run() {
     delegate.add_method(sel!(menuAction:), action as extern "C" fn(&Object, Sel, id));
     let delegate_class = delegate.register();
     let target: id = msg_send![delegate_class, new];
-    let (panel, view) = panel(view_class);
-    let (preview, preview_view) = self::panel(view_class);
+    let (panel, view) = panel(view_class, true);
+    let (preview, preview_view) = self::panel(view_class, false);
     let _: () = msg_send![preview,setLevel:24isize];
     let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
     let status: id = msg_send![status_bar,statusItemWithLength:-1.0f64];
@@ -652,13 +738,13 @@ pub unsafe fn run() {
             .map(|i| Window {
                 ax: Owned(CFRetain(kCFBooleanFalse)),
                 pid: std::process::id() as i32,
-                app: ["Finder", "Terminal", "Editor", "Browser", "Notes"][i].into(),
+                app: "PyCharm".into(),
                 title: [
-                    "Documents",
-                    "Local shell",
-                    "main.rs — RingSwitch",
-                    "Window switcher example",
-                    "Project notes",
+                    "Project Alpha — PyCharm",
+                    "Project Beta — PyCharm",
+                    "Project Gamma — PyCharm",
+                    "Project Delta — PyCharm",
+                    "Project Epsilon — PyCharm",
                 ][i]
                     .into(),
                 minimized: i == 4,

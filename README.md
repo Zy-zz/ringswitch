@@ -1,8 +1,8 @@
 # RingSwitch
 
-一个 Rust 编写的 macOS 菜单栏工具，只保留两个功能：**切换具体窗口**、**按住鼠标侧键或自定义键，通过圆盘排列当前窗口**。
+一个 Rust 编写的 macOS 菜单栏工具，只保留两个功能：**切换当前软件的具体窗口**、**按住鼠标侧键或自定义键，通过圆盘排列当前窗口**。
 
-界面采用 AltTab 风格的窗口缩略图卡片和 Loop 风格的小型环形指示器。使用原生 [AppKit](https://developer.apple.com/documentation/appkit)、[Accessibility](https://developer.apple.com/documentation/applicationservices/axuielement) 和 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)，没有 WebView、后台服务、网络请求或遥测。需要 **macOS 14 或更新版本**。Apple Silicon 本机实测；Intel 可从源码构建，尚未实测。
+界面采用原生 Liquid Glass 浮层、窗口缩略图卡片和小型环形指示器。macOS 26 使用 NSGlassEffectView，macOS 14/15 使用 NSVisualEffectView 磨砂玻璃回退。使用原生 [AppKit](https://developer.apple.com/documentation/appkit)、[Accessibility](https://developer.apple.com/documentation/applicationservices/axuielement) 和 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)，没有 WebView、后台服务、网络请求或遥测。需要 **macOS 14 或更新版本**。Apple Silicon 本机实测；Intel 可从源码构建，尚未实测。
 
 ## 灵感来源
 
@@ -14,10 +14,16 @@
 
 ## 使用
 
-- 默认 **Option + 反引号**：按住 Option，按反引号逐个选择窗口，松开 Option 激活。**Shift** 反向；方向键可选；**Esc** 取消。按物理按键识别。
+- 默认 **Option + 反引号（·）**：只在当前正在使用的软件内切换窗口，例如多个 PyCharm 项目窗口；不会混入 Chrome、微信等其它软件。按住 Option，按反引号逐个选择该软件的窗口，松开 Option 激活。**Shift** 反向；方向键可选；**Esc** 取消。按物理按键识别。
 - 默认 **鼠标后退侧键**：按住侧键，移动选择，松开执行。轻点不调整窗口；移回圆心最大化，或在圆心按住超过 0.5 秒后松开最大化；**Esc** 取消。
 - 四个正方向对应四个半屏，四个斜方向对应四个角，中央对应最大化。缩放前显示目标区域，使用触发圆盘所在显示器的可用区域，避开菜单栏和 Dock。
-- 切换器显示同一应用的多个具体窗口，分页展示并高亮当前选择。
+- 切换器在一次触发开始时固定当前软件的窗口集合，显示应用名称，分页展示并高亮当前选择。
+
+## 玻璃设计参考
+
+设计检索参考了 X 上的 Liquid Glass 案例归档：[yuhang 的探索](https://design-on-x.com/yuhanglu/status/1985470297848631419/)、[Andreas Storm 分享的案例](https://design-on-x.com/avstorm/status/1965463622865563749/)。原帖：[yuhang](https://x.com/yuhanglu/status/1985470297848631419)、[Andreas Storm](https://x.com/avstorm/status/1965463622865563749)。原帖部分访问受限，使用可访问归档核实来源，没有复制素材。
+
+实现遵循 [Apple AppKit Liquid Glass](https://developer.apple.com/documentation/appkit/nsglasseffectview)：内容置于原生玻璃 contentView 中，保留背景折射、系统阴影、细边缘高光和语义文字颜色；采用低饱和选中状态，避免整个卡片盖上不透明蓝色。
 
 ## 自定义按键
 
@@ -47,7 +53,7 @@ cargo test --locked
 ./scripts/install.sh
 ```
 
-安装到 `/Applications/RingSwitch.app` 并打开。更新前先从菜单栏退出 RingSwitch。仅构建可运行 `./scripts/build.sh`，产物为 `dist/RingSwitch.app`。
+安装到 `/Applications/RingSwitch.app` 并打开，成功后清理 `dist` 副本和 `target` 构建缓存，本机只保留一份安装应用。正常模式使用文件锁防止重复运行；诊断和开发预览例外。更新前先从菜单栏退出 RingSwitch。仅构建可运行 `./scripts/build.sh`，产物为 `dist/RingSwitch.app`。
 
 首次启动，在 **系统设置 → 隐私与安全性** 中允许：
 
@@ -70,7 +76,7 @@ cargo test --locked
 - 12 项测试：布局、死区、跨屏坐标、循环切换、自定义快捷键、左右修饰键释放、录制、冲突校验和重叠窗口的预览匹配。
 - 格式、严格 Clippy、release 构建和签名验证。
 - 实际启动检查新版卡片网格和小型环形界面。
-- 两个临时原生窗口：9 种布局经真实 Accessibility 设置并回读坐标和尺寸；分别激活并回读焦点；最小化窗口恢复。
+- 两个临时原生窗口：9 种布局经真实 Accessibility 设置并回读坐标和尺寸；分别激活并回读焦点；最小化窗口恢复；当前软件枚举只返回这两个窗口，排除其余软件。
 - 两个临时窗口经 ScreenCaptureKit 捕获，确认有效 CGImage 缩略图返回。
 
 CI 在 macOS 上运行格式、测试、Clippy 和应用构建。真实硬件侧键长按仍需鼠标试验；终端测试进程的授权不等于桌面应用已获授权。
@@ -93,7 +99,7 @@ dist/RingSwitch.app/Contents/MacOS/RingSwitch --capture-check <QA进程PID>
 
 ## 范围与限制
 
-- 列出正常应用向 Accessibility 公开的窗口，包括最小化窗口，按最近激活顺序排列。未使用私有 Space API，不能保证列出所有桌面的全部窗口。
+- 只列出当前软件向 Accessibility 公开的窗口，包括最小化窗口，按该软件内最近激活顺序排列。未使用私有 Space API，不能保证列出所有桌面的全部窗口。
 - macOS 真全屏窗口先退出全屏才能缩放；不可调整或有最小尺寸限制的应用会显示原因。
 - 若鼠标驱动把侧键转换成键盘快捷键，系统收不到原始按钮事件；请恢复普通按钮，或把转换后的键录制为圆盘触发键。
 - 无自动更新、主题管理、开机自启或其它窗口管理功能。

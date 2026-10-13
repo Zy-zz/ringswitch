@@ -1,6 +1,6 @@
 [package]
 name = "ringswitch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Two-function macOS window switcher and mouse radial tiler"
 license = "MIT"

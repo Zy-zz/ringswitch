@@ -145,13 +145,17 @@ unsafe fn app_ax(pid: i32) -> Owned {
 }
 
 pub unsafe fn focused() -> Option<Owned> {
+    attr(app_ax(frontmost_pid()?).0, "AXFocusedWindow")
+}
+
+pub unsafe fn frontmost_pid() -> Option<i32> {
     let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
     let app: id = msg_send![workspace, frontmostApplication];
     if app == nil {
         return None;
     }
     let pid: i32 = msg_send![app, processIdentifier];
-    attr(app_ax(pid).0, "AXFocusedWindow")
+    Some(pid)
 }
 
 struct WindowInfo {
@@ -186,6 +190,16 @@ fn match_window(pid: i32, rect: Rect, title: &str, infos: &[WindowInfo]) -> Opti
 }
 
 pub unsafe fn windows() -> Vec<Window> {
+    windows_for(None)
+}
+
+pub unsafe fn current_app_windows() -> Vec<Window> {
+    frontmost_pid()
+        .map(|pid| windows_for(Some(pid)))
+        .unwrap_or_default()
+}
+
+unsafe fn windows_for(scope: Option<i32>) -> Vec<Window> {
     // shortcut: public AX only; full enumeration across Spaces would require private macOS APIs.
     let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
     let apps: id = msg_send![workspace, runningApplications];
@@ -195,7 +209,10 @@ pub unsafe fn windows() -> Vec<Window> {
         let app: id = msg_send![apps, objectAtIndex:i];
         let policy: isize = msg_send![app, activationPolicy];
         let pid: i32 = msg_send![app, processIdentifier];
-        if policy != 0 || pid == std::process::id() as i32 {
+        if policy != 0
+            || pid == std::process::id() as i32
+            || scope.is_some_and(|target| pid != target)
+        {
             continue;
         }
         let name: id = msg_send![app, localizedName];
@@ -453,6 +470,11 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
             }
         }
         println!("PASS: two windows in the same app -> exact focused window readback");
+        let scoped = current_app_windows();
+        if scoped.len() != 2 || scoped.iter().any(|w| w.pid != pid) {
+            return Err("当前软件窗口集合包含其它软件，或缺少 QA 窗口".into());
+        }
+        println!("PASS: current app scope -> only the two QA windows, other apps excluded");
         let mut w = fixtures[1].clone();
         set(w.ax.0, "AXMinimized", kCFBooleanTrue)?;
         w.minimized = true;
