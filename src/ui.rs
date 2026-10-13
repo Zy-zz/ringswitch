@@ -25,6 +25,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[link(name = "QuartzCore", kind = "framework")]
+extern "C" {}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPathCreateMutable() -> Ref;
+    fn CGPathAddEllipseInRect(path: Ref, transform: Ref, rect: NSRect);
+}
+
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
@@ -133,52 +142,51 @@ unsafe fn icon(pid: i32, r: NSRect) {
         let _: () = msg_send![image,drawInRect:r];
     }
 }
-unsafe fn layout_symbol(layout: Layout, r: NSRect) {
-    outline(r, color(0.63, 0.68, 0.77, 1.), 4., 1.5);
-    let inset = Rect {
-        x: r.origin.x + 3.,
-        y: 0.,
-        w: r.size.width - 6.,
-        h: r.size.height - 6.,
-    };
-    let part = layout.rect(inset);
-    fill(
-        rect(
-            part.x,
-            r.origin.y + r.size.height - 3. - part.y - part.h,
-            part.w,
-            part.h,
-        ),
-        color(0.34, 0.68, 1., 1.),
-        2.,
-    );
+unsafe fn halo_mask(layer: id, enabled: bool) {
+    if !enabled {
+        let _: () = msg_send![layer,setMask:nil];
+        return;
+    }
+    let path = Owned(CGPathCreateMutable());
+    CGPathAddEllipseInRect(path.0, std::ptr::null(), rect(26., 26., 128., 128.));
+    CGPathAddEllipseInRect(path.0, std::ptr::null(), rect(42., 42., 96., 96.));
+    let mask: id = msg_send![class!(CAShapeLayer), layer];
+    let _: () = msg_send![mask,setPath:path.0];
+    let _: () = msg_send![mask,setFillRule:ns("even-odd")];
+    let _: () = msg_send![layer,setMask:mask];
 }
+
 extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
     unsafe {
         APP.with(|cell| {
         let Ok(app)=cell.try_borrow()else{return};let Some(app)=app.as_ref()else{return};
         let b:NSRect=msg_send![view,bounds];
         if std::ptr::eq(view,app.preview_view) {
-            fill(b,color(0.25,0.57,1.,0.14),12.);outline(rect(2.,2.,b.size.width-4.,b.size.height-4.),color(0.40,0.72,1.,0.92),10.,3.);return;
+            fill(b,color(0.35,0.62,1.,0.06),16.);outline(rect(0.75,0.75,b.size.width-1.5,b.size.height-1.5),color(0.72,0.84,1.,0.65),15.,1.5);return;
         }
         let white:id=msg_send![class!(NSColor),labelColor];
         let secondary:id=msg_send![class!(NSColor),secondaryLabelColor];
         if app.radial.is_some()||(app.demo&&!app.switching) {
             let selected=app.radial.as_ref().and_then(|r|r.selected).or(if app.demo{Some(Layout::Top)}else{None});
-            let center=NSPoint::new(90.,105.);
+            let center=NSPoint::new(90.,90.);
             for (i,layout) in Layout::DIRECTIONS.iter().enumerate() {
                 let a=-(i as f64)*45.;let path:id=msg_send![class!(NSBezierPath),bezierPath];
-                let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:58. startAngle:a-22.3 endAngle:a+22.3];
-                let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:43. startAngle:a+22.3 endAngle:a-22.3 clockwise:YES];
+                let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:64. startAngle:a-22.5 endAngle:a+22.5];
+                let _:()=msg_send![path,appendBezierPathWithArcWithCenter:center radius:48. startAngle:a+22.5 endAngle:a-22.5 clockwise:YES];
                 let _:()=msg_send![path,closePath];
-                let c=if selected==Some(*layout)||selected==Some(Layout::Maximize){color(0.25,0.57,1.,0.62)}else{color(1.,1.,1.,0.16)};
+                let lit=selected==Some(*layout)||selected==Some(Layout::Maximize);
+                let c=if lit{color(0.36,0.74,1.,0.58)}else{color(1.,1.,1.,0.09)};
                 let _:()=msg_send![c,set];let _:()=msg_send![path,fill];
+                if lit {
+                    let arc:id=msg_send![class!(NSBezierPath),bezierPath];
+                    let _:()=msg_send![arc,appendBezierPathWithArcWithCenter:center radius:56. startAngle:a-19. endAngle:a+19.];
+                    let _:()=msg_send![arc,setLineWidth:2.0f64];
+                    let c=color(0.74,0.91,1.,0.80);let _:()=msg_send![c,set];let _:()=msg_send![arc,stroke];
+                }
             }
-            fill(rect(56.,77.,68.,56.),color(1.,1.,1.,0.10),12.);
-            layout_symbol(selected.unwrap_or(Layout::Maximize),rect(68.,91.,44.,28.));
-            let label=selected.map(|s|s.label()).unwrap_or("移动选择");
-
-            text(label,rect(if selected.is_some(){72.}else{66.},20.,100.,19.),12.,white);return;
+            outline(rect(26.5,26.5,127.,127.),color(1.,1.,1.,0.50),63.5,1.);
+            outline(rect(42.5,42.5,95.,95.),color(1.,1.,1.,0.35),47.5,1.);
+            return;
         }
         outline(rect(0.5,0.5,b.size.width-1.,b.size.height-1.),color(1.,1.,1.,0.30),26.,1.);
         if !app.switching {text(&app.message,rect(24.,25.,b.size.width-48.,55.),15.,white);return;}
@@ -325,9 +333,9 @@ unsafe fn panel(view_class: &Class, glass: bool) -> (id, id) {
     let view: id = msg_send![view_class, alloc];
     let view: id = msg_send![view,initWithFrame:rect(0.,0.,300.,300.)];
     let _: () = msg_send![view,setAutoresizingMask:18usize];
-    if glass {
+    {
         let material: id;
-        if let Some(glass_class) = Class::get("NSGlassEffectView") {
+        if let Some(glass_class) = Class::get("NSGlassEffectView").filter(|_| glass) {
             let allocated: id = msg_send![glass_class, alloc];
             material = msg_send![allocated,initWithFrame:rect(0.,0.,300.,300.)];
             let _: () = msg_send![material,setStyle:0isize];
@@ -341,20 +349,83 @@ unsafe fn panel(view_class: &Class, glass: bool) -> (id, id) {
             let _: () = msg_send![material,setState:1isize];
             let _: () = msg_send![material,setWantsLayer:YES];
             let layer: id = msg_send![material, layer];
-            let _: () = msg_send![layer,setCornerRadius:26.0f64];
+            let _: () = msg_send![layer,setCornerRadius:if glass{26.0f64}else{16.0f64}];
             let _: () = msg_send![layer,setMasksToBounds:YES];
             let _: () = msg_send![material,addSubview:view];
         }
         let _: () = msg_send![p,setContentView:material];
         let _: () = msg_send![material, release];
-    } else {
-        let _: () = msg_send![p,setContentView:view];
     }
-    let _: () = msg_send![p,setHasShadow:if glass{YES}else{NO}];
+    let _: () = msg_send![p,setHasShadow:YES];
     (p, view)
 }
 
 impl App {
+    unsafe fn radial_check(&mut self, pid: i32) -> Result<(), String> {
+        let window = windows()
+            .into_iter()
+            .find(|w| w.pid == pid && w.title.starts_with("RingSwitch QA "))
+            .ok_or("需要 QA 测试窗口")?;
+        activate(&window)?;
+        let original = frame(window.ax.0).ok_or("无法读取测试窗口")?;
+        let screen = screens().first().ok_or("没有显示器")?.1;
+        let origin = (screen.x + screen.w / 2., screen.y + screen.h / 2.);
+        let result = (|| {
+            for (i, layout) in Layout::DIRECTIONS.into_iter().enumerate() {
+                self.command(Command::RadialStart(origin.0, origin.1));
+                let angle = i as f64 * std::f64::consts::FRAC_PI_4;
+                self.command(Command::RadialMove(
+                    origin.0 + angle.cos() * 90.,
+                    origin.1 + angle.sin() * 90.,
+                ));
+                let radial = self.radial.as_ref().ok_or("没有光环")?;
+                if radial.selected != Some(layout) {
+                    return Err("光环方向不匹配".into());
+                }
+                let shown: bool = msg_send![self.preview, isVisible];
+                let preview_frame: NSRect = msg_send![self.preview, frame];
+                let target = layout.rect(screen);
+                if !shown
+                    || (preview_frame.origin.x - target.x).abs() > 1.
+                    || (preview_frame.origin.y - (primary_height() - target.y - target.h)).abs()
+                        > 1.
+                    || (preview_frame.size.width - target.w).abs() > 1.
+                    || (preview_frame.size.height - target.h).abs() > 1.
+                {
+                    return Err("目标区域预览不匹配".into());
+                }
+                if frame(window.ax.0) != Some(original) {
+                    return Err("松开前窗口已被改变".into());
+                }
+                self.command(Command::Cancel);
+                let shown: bool = msg_send![self.preview, isVisible];
+                if shown || frame(window.ax.0) != Some(original) {
+                    return Err("取消后预览未消失或窗口被改变".into());
+                }
+            }
+            println!("PASS: 8 directions -> visible glass target frame; window unchanged until release; cancel hides preview");
+            self.command(Command::RadialStart(origin.0, origin.1));
+            self.command(Command::RadialEnd(origin.0 + 90., origin.1));
+            let actual = frame(window.ax.0).ok_or("无法回读松开后的窗口")?;
+            let target = Layout::Right.rect(screen);
+            if (actual.x - target.x).abs() > 4.
+                || (actual.y - target.y).abs() > 4.
+                || (actual.w - target.w).abs() > 4.
+                || (actual.h - target.h).abs() > 4.
+            {
+                return Err("松开后窗口位置不匹配".into());
+            }
+            let shown: bool = msg_send![self.preview, isVisible];
+            if shown {
+                return Err("确认后预览未消失".into());
+            }
+            println!("PASS: release -> actual resize readback and preview dismissed");
+            Ok(())
+        })();
+        self.hide();
+        result.and(resize(window.ax.0, original))
+    }
+
     unsafe fn show(&mut self, x: f64, y: f64, w: f64, h: f64) {
         let radius = if w == 180. && h == 180. { 90. } else { 26. };
         let material: id = msg_send![self.panel, contentView];
@@ -364,6 +435,9 @@ impl App {
             let layer: id = msg_send![material, layer];
             let _: () = msg_send![layer,setCornerRadius:radius];
         }
+        let _: () = msg_send![material,setWantsLayer:YES];
+        let layer: id = msg_send![material, layer];
+        halo_mask(layer, w == 180. && h == 180.);
         let _: () = msg_send![self.panel,setFrame:rect(x,primary_height()-y-h,w,h) display:YES];
         let _: () = msg_send![self.view,setNeedsDisplay:YES];
         let _: () = msg_send![self.panel, orderFrontRegardless];
@@ -551,7 +625,7 @@ impl App {
                     started: Instant::now(),
                 });
                 // Keep the ring centered at the actual cursor, even near display edges.
-                self.show(x - 90., y - 75., 180., 180.);
+                self.show(x - 90., y - 90., 180., 180.);
             }
             Command::RadialMove(x, y) => self.move_radial(x, y),
             Command::RadialEnd(x, y) => {
@@ -577,7 +651,11 @@ impl App {
         if dx.hypot(dy) >= 28. || r.started.elapsed() > Duration::from_millis(500) {
             r.armed = true;
         }
-        r.selected = selection(dx, dy, r.armed);
+        let selected = selection(dx, dy, r.armed);
+        if selected == r.selected {
+            return;
+        }
+        r.selected = selected;
         let _: () = msg_send![self.view,setNeedsDisplay:YES];
         if let Some(layout) = r.selected {
             let t = layout.rect(r.screen);
@@ -664,7 +742,7 @@ pub unsafe fn run() {
     }
     let _instance_lock = if args
         .iter()
-        .any(|a| a.starts_with("--demo") || a == "--qa-windows")
+        .any(|a| a.starts_with("--demo") || a == "--qa-windows" || a == "--radial-check")
     {
         None
     } else {
@@ -732,6 +810,19 @@ pub unsafe fn run() {
         requested: HashSet::new(),
     };
     app.update_menu();
+    if let Some(index) = args.iter().position(|a| a == "--radial-check") {
+        let result = args
+            .get(index + 1)
+            .and_then(|s| s.parse().ok())
+            .ok_or("需要 QA 进程 PID".into())
+            .and_then(|pid| app.radial_check(pid));
+        if let Err(e) = result {
+            eprintln!("FAIL: {e}");
+            std::process::exit(1);
+        }
+        pool.drain();
+        return;
+    }
     if args.iter().any(|a| a == "--demo-switch") {
         app.switching = true;
         app.windows = (0..5)
@@ -756,6 +847,12 @@ pub unsafe fn run() {
     } else if demo && !qa {
         let s = screens()[0].1;
         app.show(s.x + s.w / 2. - 90., s.y + s.h / 2. - 90., 180., 180.);
+        if args.iter().any(|a| a == "--demo-preview") {
+            let t = Layout::Top.rect(s);
+            let _: () = msg_send![app.preview,setFrame:rect(t.x,primary_height()-t.y-t.h,t.w,t.h) display:YES];
+            let _: () = msg_send![app.preview, orderFrontRegardless];
+            let _: () = msg_send![app.panel, orderFrontRegardless];
+        }
     } else if !demo && (!AXIsProcessTrusted() || !CGPreflightListenEventAccess()) {
         app.toast("请在菜单栏 RS ! 中开启辅助功能与输入监控权限");
         CGRequestListenEventAccess();
