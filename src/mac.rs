@@ -94,38 +94,76 @@ pub unsafe fn string(s: Ref) -> String {
     }
 }
 pub unsafe fn attr(element: Ref, name: &str) -> Option<Owned> {
-    let mut value = null();
-    if AXUIElementCopyAttributeValue(element, ns(name) as Ref, &mut value) == 0 && !value.is_null()
-    {
-        Some(Owned(value))
-    } else {
-        None
+    copy_attr(element, name, 0.08).ok()
+}
+
+// Only retry idempotent AX reads, assignments and AXRaise; a busy app may finish later.
+fn ax_request<T>(mut request: impl FnMut(f32) -> Result<T, i32>) -> Result<T, i32> {
+    match request(0.08) {
+        Err(-25204) => request(1.0),
+        result => result,
     }
 }
-pub unsafe fn set(element: Ref, name: &str, value: Ref) -> Result<(), String> {
-    let error = AXUIElementSetAttributeValue(element, ns(name) as Ref, value);
-    if error == 0 {
-        Ok(())
+
+unsafe fn copy_attr(element: Ref, name: &str, timeout: f32) -> Result<Owned, i32> {
+    let mut value = null();
+    AXUIElementSetMessagingTimeout(element, timeout);
+    let error = AXUIElementCopyAttributeValue(element, ns(name) as Ref, &mut value);
+    if error == 0 && !value.is_null() {
+        Ok(Owned(value))
     } else {
-        Err(format!("{name}: Accessibility error {error}"))
+        Err(if error == 0 { -25212 } else { error })
     }
+}
+
+fn busy_error() -> String {
+    "当前软件暂时未响应，请稍后重试 (-25204)".into()
+}
+
+unsafe fn query_attr(element: Ref, name: &str) -> Result<Option<Owned>, String> {
+    match ax_request(|timeout| copy_attr(element, name, timeout)) {
+        Ok(value) => Ok(Some(value)),
+        Err(-25204) => Err(busy_error()),
+        Err(_) => Ok(None),
+    }
+}
+
+pub unsafe fn set(element: Ref, name: &str, value: Ref) -> Result<(), String> {
+    ax_request(|timeout| {
+        AXUIElementSetMessagingTimeout(element, timeout);
+        let error = AXUIElementSetAttributeValue(element, ns(name) as Ref, value);
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+    .map_err(|error| format!("{name}: Accessibility error {error}"))
 }
 pub unsafe fn frame(element: Ref) -> Option<Rect> {
-    let p = attr(element, "AXPosition")?;
-    let s = attr(element, "AXSize")?;
+    frame_result(element).ok().flatten()
+}
+
+unsafe fn frame_result(element: Ref) -> Result<Option<Rect>, String> {
+    let Some(p) = query_attr(element, "AXPosition")? else {
+        return Ok(None);
+    };
+    let Some(s) = query_attr(element, "AXSize")? else {
+        return Ok(None);
+    };
     let mut position = NSPoint::new(0., 0.);
     let mut size = NSSize::new(0., 0.);
     if !AXValueGetValue(p.0, 1, &mut position as *mut _ as *mut c_void)
         || !AXValueGetValue(s.0, 2, &mut size as *mut _ as *mut c_void)
     {
-        return None;
+        return Ok(None);
     }
-    Some(Rect {
+    Ok(Some(Rect {
         x: position.x,
         y: position.y,
         w: size.width,
         h: size.height,
-    })
+    }))
 }
 
 #[derive(Clone)]
@@ -139,9 +177,7 @@ pub struct Window {
 }
 
 unsafe fn app_ax(pid: i32) -> Owned {
-    let ax = Owned(AXUIElementCreateApplication(pid));
-    AXUIElementSetMessagingTimeout(ax.0, 0.08);
-    ax
+    Owned(AXUIElementCreateApplication(pid))
 }
 
 pub unsafe fn focused() -> Option<Owned> {
@@ -190,16 +226,17 @@ fn match_window(pid: i32, rect: Rect, title: &str, infos: &[WindowInfo]) -> Opti
 }
 
 pub unsafe fn windows() -> Vec<Window> {
-    windows_for(None)
+    windows_for(None).unwrap_or_default()
 }
 
-pub unsafe fn current_app_windows() -> Vec<Window> {
-    frontmost_pid()
-        .map(|pid| windows_for(Some(pid)))
-        .unwrap_or_default()
+pub unsafe fn current_app_windows() -> Result<Vec<Window>, String> {
+    match frontmost_pid() {
+        Some(pid) => windows_for(Some(pid)),
+        None => Ok(vec![]),
+    }
 }
 
-unsafe fn windows_for(scope: Option<i32>) -> Vec<Window> {
+unsafe fn windows_for(scope: Option<i32>) -> Result<Vec<Window>, String> {
     // shortcut: public AX only; full enumeration across Spaces would require private macOS APIs.
     let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
     let apps: id = msg_send![workspace, runningApplications];
@@ -216,45 +253,10 @@ unsafe fn windows_for(scope: Option<i32>) -> Vec<Window> {
             continue;
         }
         let name: id = msg_send![app, localizedName];
-        let ax = app_ax(pid);
-        let mut elements = Vec::new();
-        if let Some(list) = attr(ax.0, "AXWindows") {
-            for j in 0..CFArrayGetCount(list.0) {
-                elements.push(Owned(CFRetain(CFArrayGetValueAtIndex(list.0, j))));
-            }
-        }
-        // Some apps omit the focused/main window from AXWindows on another Space.
-        for key in ["AXFocusedWindow", "AXMainWindow"] {
-            if let Some(w) = attr(ax.0, key) {
-                if !elements.contains(&w) {
-                    elements.push(w);
-                }
-            }
-        }
-        for element in elements {
-            AXUIElementSetMessagingTimeout(element.0, 0.08);
-            if attr(element.0, "AXRole").map(|v| string(v.0)).as_deref() != Some("AXWindow") {
-                continue;
-            }
-            let Some(rect) = frame(element.0) else {
-                continue;
-            };
-            if rect.w < 80. || rect.h < 40. {
-                continue;
-            }
-            let title = attr(element.0, "AXTitle")
-                .map(|v| string(v.0))
-                .unwrap_or_default();
-            let minimized =
-                attr(element.0, "AXMinimized").is_some_and(|v| CFEqual(v.0, kCFBooleanTrue));
-            windows.push(Window {
-                ax: element,
-                pid,
-                app: string(name as Ref),
-                title,
-                minimized,
-                number: 0,
-            });
+        match app_windows(pid, &string(name as Ref)) {
+            Ok(found) => windows.extend(found),
+            Err(error) if scope.is_some() => return Err(error),
+            Err(_) => (),
         }
     }
     // Use public WindowServer bounds to seed front-to-back ordering without private window IDs.
@@ -311,7 +313,55 @@ unsafe fn windows_for(scope: Option<i32>) -> Vec<Window> {
                 .unwrap_or(usize::MAX)
         });
     }
-    windows
+    Ok(windows)
+}
+
+unsafe fn app_windows(pid: i32, name: &str) -> Result<Vec<Window>, String> {
+    let ax = app_ax(pid);
+    let mut elements = Vec::new();
+    if let Some(list) = query_attr(ax.0, "AXWindows")? {
+        for j in 0..CFArrayGetCount(list.0) {
+            elements.push(Owned(CFRetain(CFArrayGetValueAtIndex(list.0, j))));
+        }
+    }
+    // Some apps omit the focused/main window from AXWindows on another Space.
+    for key in ["AXFocusedWindow", "AXMainWindow"] {
+        if let Some(w) = query_attr(ax.0, key)? {
+            if !elements.contains(&w) {
+                elements.push(w);
+            }
+        }
+    }
+    let mut windows = Vec::new();
+    for element in elements {
+        if query_attr(element.0, "AXRole")?
+            .map(|v| string(v.0))
+            .as_deref()
+            != Some("AXWindow")
+        {
+            continue;
+        }
+        let Some(rect) = frame_result(element.0)? else {
+            continue;
+        };
+        if rect.w < 80. || rect.h < 40. {
+            continue;
+        }
+        let title = query_attr(element.0, "AXTitle")?
+            .map(|v| string(v.0))
+            .unwrap_or_default();
+        let minimized =
+            query_attr(element.0, "AXMinimized")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue));
+        windows.push(Window {
+            ax: element,
+            pid,
+            app: name.into(),
+            title,
+            minimized,
+            number: 0,
+        });
+    }
+    Ok(windows)
 }
 
 pub unsafe fn activate(window: &Window) -> Result<(), String> {
@@ -325,19 +375,52 @@ pub unsafe fn activate(window: &Window) -> Result<(), String> {
         set(window.ax.0, "AXMinimized", kCFBooleanFalse)?;
     }
     let _: bool = msg_send![app, activateWithOptions:2usize];
-    let error = AXUIElementPerformAction(window.ax.0, ns("AXRaise") as Ref);
-    if error != 0 {
-        return Err(format!("无法激活窗口 ({error})"));
-    }
+    let result = ax_request(|timeout| {
+        AXUIElementSetMessagingTimeout(window.ax.0, timeout);
+        let error = AXUIElementPerformAction(window.ax.0, ns("AXRaise") as Ref);
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    });
+    result.map_err(|error| {
+        if error == -25204 {
+            busy_error()
+        } else {
+            format!("无法激活窗口 ({error})")
+        }
+    })?;
     let _ = set(window.ax.0, "AXMain", kCFBooleanTrue);
     let _ = set(app_ax(window.pid).0, "AXFocusedWindow", window.ax.0);
     Ok(())
 }
 
 pub unsafe fn resize(window: Ref, rect: Rect) -> Result<(), String> {
-    if attr(window, "AXFullScreen").is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
-        return Err("请先退出 macOS 全屏模式".into());
+    if query_attr(window, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
+        set(window, "AXFullScreen", kCFBooleanFalse)
+            .map_err(|e| format!("无法退出 macOS 全屏：{e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            // AXFullScreen can clear before the Space animation allows resizing.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let state =
+                query_attr(window, "AXFullScreen")?.ok_or("无法确认窗口是否已退出 macOS 全屏")?;
+            if CFEqual(state.0, kCFBooleanFalse) && resize_frame(window, rect).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if resize_frame(window, rect).is_ok() {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("退出全屏后未能完成缩放，请稍后重试（或检查窗口最小尺寸限制）".into());
+            }
+        }
     }
+    resize_frame(window, rect)
+}
+
+unsafe fn resize_frame(window: Ref, rect: Rect) -> Result<(), String> {
     let position = NSPoint::new(rect.x, rect.y);
     let size = NSSize::new(rect.w, rect.h);
     let p = Owned(AXValueCreate(1, &position as *const _ as *const c_void));
@@ -462,6 +545,24 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
             }
         }
         println!("PASS: all 9 layouts -> real AX position/size readback");
+        set(window.ax.0, "AXFullScreen", kCFBooleanTrue)?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if !query_attr(window.ax.0, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
+            return Err("QA 窗口未进入原生全屏".into());
+        }
+        let target = crate::geometry::Layout::DIRECTIONS[0].rect(screen);
+        resize(window.ax.0, target)?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let actual = frame(window.ax.0).ok_or("没有退出全屏后的窗口回读")?;
+        if !query_attr(window.ax.0, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanFalse))
+            || (actual.x - target.x).abs() > 4.
+            || (actual.y - target.y).abs() > 4.
+            || (actual.w - target.w).abs() > 4.
+            || (actual.h - target.h).abs() > 4.
+        {
+            return Err(format!("退出全屏后布局未保持: {actual:?}"));
+        }
+        println!("PASS: native fullscreen -> exit -> tiled frame survives Space animation");
         for w in &fixtures {
             activate(w)?;
             let actual = attr(app.0, "AXFocusedWindow").ok_or("没有焦点窗口")?;
@@ -470,7 +571,7 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
             }
         }
         println!("PASS: two windows in the same app -> exact focused window readback");
-        let scoped = current_app_windows();
+        let scoped = current_app_windows()?;
         if scoped.len() != 2 || scoped.iter().any(|w| w.pid != pid) {
             return Err("当前软件窗口集合包含其它软件，或缺少 QA 窗口".into());
         }
@@ -492,6 +593,29 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ax_retries_only_transient_messaging_failures_once() {
+        for (errors, expected, timeouts) in [
+            (vec![0], 0, vec![0.08]),
+            (vec![-25202], -25202, vec![0.08]),
+            (vec![-25212], -25212, vec![0.08]),
+            (vec![-25204, 0], 0, vec![0.08, 1.0]),
+            (vec![-25204, -25204], -25204, vec![0.08, 1.0]),
+        ] {
+            let mut seen = Vec::new();
+            let mut errors = errors.into_iter();
+            let result = ax_request(|timeout| {
+                seen.push(timeout);
+                match errors.next().expect("unexpected AX request") {
+                    0 => Ok(()),
+                    error => Err(error),
+                }
+            });
+            assert_eq!(result.err().unwrap_or(0), expected);
+            assert_eq!(seen, timeouts);
+        }
+    }
+
     #[test]
     fn overlapping_windows_never_share_the_wrong_thumbnail() {
         let r = Rect {

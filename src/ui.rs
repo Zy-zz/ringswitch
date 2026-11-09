@@ -73,6 +73,8 @@ struct Radial {
 struct App {
     panel: id,
     view: id,
+    help: id,
+    help_popover: id,
     preview: id,
     preview_view: id,
     status: id,
@@ -114,14 +116,13 @@ unsafe fn text(s: &str, r: NSRect, size: f64, c: id) {
     let keys = [ns("NSFont"), ns("NSColor")];
     let values = [font, c];
     let attrs: id = msg_send![class!(NSDictionary), dictionaryWithObjects:values.as_ptr() forKeys:keys.as_ptr() count:2usize];
-    let _: () = msg_send![ns(s),drawInRect:r withAttributes:attrs];
+    let _: () = msg_send![ns(s),drawWithRect:r options:33usize attributes:attrs];
 }
-fn shorten(s: &str, count: usize) -> String {
-    if s.chars().count() <= count {
-        s.into()
-    } else {
-        s.chars().take(count - 1).chain(['…']).collect()
-    }
+unsafe fn text_width(s: &str, size: f64) -> f64 {
+    let font: id = msg_send![class!(NSFont), systemFontOfSize:size];
+    let attrs: id = msg_send![class!(NSDictionary),dictionaryWithObject:font forKey:ns("NSFont")];
+    let size: NSSize = msg_send![ns(s),sizeWithAttributes:attrs];
+    size.width.ceil()
 }
 
 unsafe fn outline(r: NSRect, c: id, radius: f64, width: f64) {
@@ -190,14 +191,14 @@ extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
         }
         outline(rect(0.5,0.5,b.size.width-1.,b.size.height-1.),color(1.,1.,1.,0.30),26.,1.);
         if !app.switching {text(&app.message,rect(24.,25.,b.size.width-48.,55.),15.,white);return;}
-        let config=*app.controls.config.lock().unwrap();
         let heading=app.windows.first().map(|w|w.app.as_str()).unwrap_or("当前软件");
-        text(heading,rect(24.,b.size.height-37.,b.size.width-110.,22.),15.,white);
+        if let Some(window)=app.windows.first(){icon(window.pid,rect(22.,b.size.height-36.,22.,22.));}
+        text(heading,rect(52.,b.size.height-37.,text_width(heading,15.).min(b.size.width-158.),22.),15.,white);
         text(&format!("{} / {}",app.selected+1,app.windows.len()),rect(b.size.width-80.,b.size.height-34.,65.,20.),12.,secondary);
         let capacity=app.grid.0*app.grid.1;let start=app.selected/capacity*capacity;
         for (position,window) in app.windows.iter().skip(start).take(capacity).enumerate() {
             let index=start+position;let col=position%app.grid.0;let row=position/app.grid.0;
-            let x=16.+col as f64*220.;let y=b.size.height-46.-(row+1)as f64*184.;
+            let x=16.+col as f64*220.;let y=b.size.height-38.-(row+1)as f64*184.;
             let card=rect(x,y,208.,172.);
             fill(card,if index==app.selected{color(0.34,0.62,1.,0.15)}else{color(1.,1.,1.,0.06)},15.);
             if index==app.selected{outline(rect(x+1.,y+1.,206.,170.),color(0.30,0.60,1.,0.65),14.,1.4);}
@@ -212,14 +213,12 @@ extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
                 let _:()=msg_send![nsimage,release];
             }else{
                 icon(window.pid,rect(x+80.,y+86.,48.,48.));
-                text(if window.minimized{"已最小化"}else{"窗口预览"},rect(x+69.,y+59.,105.,18.),11.,secondary);
+                let label=if window.minimized{"已最小化"}else{"窗口预览"};
+                let width=text_width(label,11.);
+                text(label,rect(x+(208.-width)/2.,y+59.,width,18.),11.,secondary);
             }
-            icon(window.pid,rect(x+10.,y+12.,20.,20.));
-            text(&shorten(if window.title.is_empty(){&window.app}else{&window.title},24),rect(x+37.,y+18.,163.,19.),12.,white);
-            text(if window.minimized{"已最小化"}else{"窗口"},rect(x+37.,y+3.,163.,16.),10.,secondary);
+            text(if window.title.is_empty(){&window.app}else{&window.title},rect(x+10.,y+11.,188.,19.),12.,white);
         }
-        let hold=config.switch.label();
-        text(&format!("{} · 松开修饰键切换 · Shift 反向 · Esc 取消",hold),rect(22.,12.,b.size.width-44.,22.),11.,secondary);
     });
     }
 }
@@ -304,6 +303,14 @@ extern "C" fn action(_: &Object, _: Sel, sender: id) {
                 9=>{let mut c=*app.controls.config.lock().unwrap();c.radial=None;app.save_config(c);}
                 10=>{app.save_config(Config::default());}
                 11=>{CGRequestScreenCaptureAccess();open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");}
+                12=>{
+                    let controller:id=msg_send![app.help_popover,contentViewController];
+                    let label:id=msg_send![controller,view];
+                    let hint:id=msg_send![sender,toolTip];
+                    let _:()=msg_send![label,setStringValue:hint];
+                    let bounds:NSRect=msg_send![sender,bounds];
+                    let _:()=msg_send![app.help_popover,showRelativeToRect:bounds ofView:sender preferredEdge:1usize];
+                }
                 6 => {
                     let application: id = msg_send![class!(NSApplication), sharedApplication];
                     let _: () = msg_send![application,terminate:nil];
@@ -427,6 +434,8 @@ impl App {
     }
 
     unsafe fn show(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        let _: () = msg_send![self.help,setHidden:if self.switching{NO}else{YES}];
+        let _: () = msg_send![self.panel,setIgnoresMouseEvents:if self.switching{NO}else{YES}];
         let radius = if w == 180. && h == 180. { 90. } else { 26. };
         let material: id = msg_send![self.panel, contentView];
         if Class::get("NSGlassEffectView").is_some() {
@@ -454,6 +463,7 @@ impl App {
     unsafe fn hide(&mut self) {
         self.switching = false;
         self.radial = None;
+        let _: () = msg_send![self.help_popover, close];
         let _: () = msg_send![self.panel,orderOut:nil];
         let _: () = msg_send![self.preview,orderOut:nil];
     }
@@ -517,12 +527,21 @@ impl App {
                 self.windows.len().clamp(1, 4)
             },
         );
-        let rows = (((s.h - 86.) / 184.) as usize)
+        let rows = (((s.h - 54.) / 184.) as usize)
             .clamp(1, 3)
             .min(self.windows.len().div_ceil(cols).max(1));
         self.grid = (cols, rows);
         let w = 32. + cols as f64 * 220.;
-        let h = 86. + rows as f64 * 184.;
+        let h = 54. + rows as f64 * 184.;
+        let heading = self
+            .windows
+            .first()
+            .map(|w| w.app.as_str())
+            .unwrap_or("当前软件");
+        let help_x = 60. + text_width(heading, 15.).min(w - 158.);
+        let _: () = msg_send![self.help,setFrame:rect(help_x,h-31.5,11.,11.)];
+        let hold = self.controls.config.lock().unwrap().switch.label();
+        let _: () = msg_send![self.help,setToolTip:ns(&format!("{} · 松开修饰键切换 · Shift 反向 · 方向键选择 · Esc 取消",hold))];
         self.show(s.x + (s.w - w) / 2., s.y + (s.h - h) / 2., w, h);
         let capacity = cols * rows;
         let start = self.selected / capacity * capacity;
@@ -544,7 +563,13 @@ impl App {
                     self.session = self.session.wrapping_add(1);
                     self.thumbnails.clear();
                     self.requested.clear();
-                    self.windows = current_app_windows();
+                    self.windows = match current_app_windows() {
+                        Ok(windows) => windows,
+                        Err(error) => {
+                            self.toast(&error);
+                            return;
+                        }
+                    };
                     self.windows.sort_by_key(|w| {
                         self.mru
                             .iter()
@@ -767,6 +792,31 @@ pub unsafe fn run() {
     let delegate_class = delegate.register();
     let target: id = msg_send![delegate_class, new];
     let (panel, view) = panel(view_class, true);
+    let help: id = msg_send![class!(NSButton), alloc];
+    let help: id = msg_send![help,initWithFrame:rect(0.,0.,11.,11.)];
+    let _: () = msg_send![help,setBordered:NO];
+    let _: () = msg_send![help,setTitle:ns("?")];
+    let font: id = msg_send![class!(NSFont),systemFontOfSize:7.5f64];
+    let _: () = msg_send![help,setFont:font];
+    let _: () = msg_send![help,setWantsLayer:YES];
+    let layer: id = msg_send![help, layer];
+    let _: () = msg_send![layer,setCornerRadius:5.5f64];
+    let background: id = msg_send![color(1., 1., 1., 0.10), CGColor];
+    let _: () = msg_send![layer,setBackgroundColor:background];
+    let _: () = msg_send![help,setAccessibilityLabel:ns("窗口切换帮助")];
+    let _: () = msg_send![help,setTarget:target];
+    let _: () = msg_send![help,setAction:sel!(menuAction:)];
+    let _: () = msg_send![help,setTag:12isize];
+    let _: () = msg_send![view,addSubview:help];
+    let _: () = msg_send![help, release];
+    let help_popover: id = msg_send![class!(NSPopover), new];
+    let controller: id = msg_send![class!(NSViewController), new];
+    let label: id = msg_send![class!(NSTextField),wrappingLabelWithString:ns("")];
+    let _: () = msg_send![controller,setView:label];
+    let _: () = msg_send![help_popover,setContentViewController:controller];
+    let _: () = msg_send![controller, release];
+    let _: () = msg_send![help_popover,setContentSize:NSSize::new(300.,56.)];
+    let _: () = msg_send![help_popover,setBehavior:1isize];
     let (preview, preview_view) = self::panel(view_class, false);
     let _: () = msg_send![preview,setLevel:24isize];
     let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
@@ -783,6 +833,8 @@ pub unsafe fn run() {
     let mut app = App {
         panel,
         view,
+        help,
+        help_popover,
         preview,
         preview_view,
         status,
