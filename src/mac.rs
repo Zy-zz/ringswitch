@@ -1,4 +1,4 @@
-use crate::geometry::{cocoa_to_ax, Rect};
+use crate::geometry::{cocoa_to_ax, Layout, Rect};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use objc::{class, msg_send, sel, sel_impl};
@@ -397,6 +397,17 @@ pub unsafe fn activate(window: &Window) -> Result<(), String> {
 }
 
 pub unsafe fn resize(window: Ref, rect: Rect) -> Result<(), String> {
+    resize_to(window, || Ok(rect))
+}
+
+pub unsafe fn tile(window: Ref, layout: Layout, x: f64, y: f64) -> Result<(), String> {
+    resize_to(window, || {
+        let screen = screen_at(&screens(), x, y).ok_or("没有可用显示器")?;
+        Ok(layout.rect(screen))
+    })
+}
+
+unsafe fn resize_to(window: Ref, target: impl Fn() -> Result<Rect, String>) -> Result<(), String> {
     if query_attr(window, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
         set(window, "AXFullScreen", kCFBooleanFalse)
             .map_err(|e| format!("无法退出 macOS 全屏：{e}"))?;
@@ -406,9 +417,9 @@ pub unsafe fn resize(window: Ref, rect: Rect) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let state =
                 query_attr(window, "AXFullScreen")?.ok_or("无法确认窗口是否已退出 macOS 全屏")?;
-            if CFEqual(state.0, kCFBooleanFalse) && resize_frame(window, rect).is_ok() {
+            if CFEqual(state.0, kCFBooleanFalse) && resize_frame(window, target()?).is_ok() {
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                if resize_frame(window, rect).is_ok() {
+                if resize_frame(window, target()?).is_ok() {
                     return Ok(());
                 }
             }
@@ -417,7 +428,7 @@ pub unsafe fn resize(window: Ref, rect: Rect) -> Result<(), String> {
             }
         }
     }
-    resize_frame(window, rect)
+    resize_frame(window, target()?)
 }
 
 unsafe fn resize_frame(window: Ref, rect: Rect) -> Result<(), String> {
@@ -425,19 +436,51 @@ unsafe fn resize_frame(window: Ref, rect: Rect) -> Result<(), String> {
     let size = NSSize::new(rect.w, rect.h);
     let p = Owned(AXValueCreate(1, &position as *const _ as *const c_void));
     let s = Owned(AXValueCreate(2, &size as *const _ as *const c_void));
-    // Shrink first so a large window can move into a corner, then reapply size after moving.
-    set(window, "AXSize", s.0)?;
-    set(window, "AXPosition", p.0)?;
-    set(window, "AXSize", s.0)?;
-    let actual = frame(window).ok_or("无法读取调整后的窗口")?;
-    if (actual.w - rect.w).abs() > 4.
-        || (actual.h - rect.h).abs() > 4.
-        || (actual.x - rect.x).abs() > 4.
-        || (actual.y - rect.y).abs() > 4.
-    {
-        return Err("程序的最小窗口尺寸限制了缩放".into());
+    settle_frame(
+        rect,
+        |apply| {
+            if apply {
+                // Moving or growing can clamp the other attribute, especially across displays.
+                set(window, "AXSize", s.0)?;
+                set(window, "AXPosition", p.0)?;
+                set(window, "AXSize", s.0)?;
+                set(window, "AXPosition", p.0)?;
+            }
+            frame_result(window)?.ok_or("无法读取调整后的窗口".into())
+        },
+        || std::thread::sleep(std::time::Duration::from_millis(50)),
+    )
+}
+
+fn frame_matches(actual: Rect, target: Rect) -> bool {
+    (actual.x - target.x).abs() <= 4.
+        && (actual.y - target.y).abs() <= 4.
+        && (actual.w - target.w).abs() <= 4.
+        && (actual.h - target.h).abs() <= 4.
+}
+
+fn settle_frame(
+    target: Rect,
+    mut step: impl FnMut(bool) -> Result<Rect, String>,
+    mut wait: impl FnMut(),
+) -> Result<(), String> {
+    let mut stable = 0;
+    for poll in 0..30 {
+        let actual = step(stable == 0 && poll % 3 == 0)?;
+        stable = if frame_matches(actual, target) {
+            stable + 1
+        } else {
+            0
+        };
+        // AX success can precede an animation or a delayed app layout that restores the old frame.
+        if stable == 5 {
+            return Ok(());
+        }
+        if poll < 29 {
+            wait();
+        }
     }
-    Ok(())
+    Err("窗口未能保持目标位置和尺寸，请检查软件的窗口尺寸限制或是否仍在切换全屏".into())
 }
 
 pub unsafe fn screens() -> Vec<(Rect, Rect)> {
@@ -525,33 +568,51 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
     if fixtures.len() != 2 {
         return Err("需要两个 RingSwitch QA 测试窗口".into());
     }
-    let screen = screens().first().ok_or("没有显示器")?.1;
+    let displays = screens();
+    let screen = displays.first().ok_or("没有显示器")?.1;
     let window = &fixtures[0];
     let original = frame(window.ax.0).ok_or("无法读取 QA 窗口")?;
     let result = (|| {
-        for layout in crate::geometry::Layout::DIRECTIONS
-            .into_iter()
-            .chain([crate::geometry::Layout::Maximize])
-        {
-            let target = layout.rect(screen);
-            resize(window.ax.0, target)?;
-            let actual = frame(window.ax.0).ok_or("没有缩放回读")?;
-            if (actual.x - target.x).abs() > 4.
-                || (actual.y - target.y).abs() > 4.
-                || (actual.w - target.w).abs() > 4.
-                || (actual.h - target.h).abs() > 4.
-            {
-                return Err(format!("{} 回读不匹配: {actual:?}", layout.label()));
+        let mut transitions = 0;
+        for (_, source) in &displays {
+            for (full, _) in &displays {
+                let anchor = (full.x + full.w / 2., full.y + full.h / 2.);
+                for layout in Layout::DIRECTIONS.into_iter().chain([Layout::Maximize]) {
+                    resize(window.ax.0, *source).map_err(|e| {
+                        format!(
+                            "准备起始布局 {source:?} 失败: {e}, 实际: {:?}",
+                            frame(window.ax.0)
+                        )
+                    })?;
+                    tile(window.ax.0, layout, anchor.0, anchor.1).map_err(|e| {
+                        format!(
+                            "{} 至显示器 {full:?} 失败: {e}, 实际: {:?}",
+                            layout.label(),
+                            frame(window.ax.0)
+                        )
+                    })?;
+                    let target = layout.rect(screen_at(&screens(), anchor.0, anchor.1).unwrap());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let actual = frame(window.ax.0).ok_or("没有缩放回读")?;
+                    if !frame_matches(actual, target) {
+                        return Err(format!(
+                            "{} 回读不匹配: {actual:?}, 目标: {target:?}",
+                            layout.label()
+                        ));
+                    }
+                    transitions += 1;
+                }
             }
         }
-        println!("PASS: all 9 layouts -> real AX position/size readback");
+        println!("PASS: {transitions} same/cross-display transitions -> all 9 layouts stable after one call");
         set(window.ax.0, "AXFullScreen", kCFBooleanTrue)?;
         std::thread::sleep(std::time::Duration::from_secs(2));
         if !query_attr(window.ax.0, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
             return Err("QA 窗口未进入原生全屏".into());
         }
-        let target = crate::geometry::Layout::DIRECTIONS[0].rect(screen);
-        resize(window.ax.0, target)?;
+        let anchor = (screen.x + screen.w / 2., screen.y + screen.h / 2.);
+        tile(window.ax.0, Layout::Right, anchor.0, anchor.1)?;
+        let target = Layout::Right.rect(screen_at(&screens(), anchor.0, anchor.1).unwrap());
         std::thread::sleep(std::time::Duration::from_secs(1));
         let actual = frame(window.ax.0).ok_or("没有退出全屏后的窗口回读")?;
         if !query_attr(window.ax.0, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanFalse))
@@ -578,6 +639,7 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
         println!("PASS: current app scope -> only the two QA windows, other apps excluded");
         let mut w = fixtures[1].clone();
         set(w.ax.0, "AXMinimized", kCFBooleanTrue)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
         w.minimized = true;
         activate(&w)?;
         if attr(w.ax.0, "AXMinimized").is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
@@ -593,6 +655,106 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_waits_for_delayed_layout_and_reapplies_clamped_frame() {
+        let target = Rect {
+            x: 500.,
+            y: 30.,
+            w: 500.,
+            h: 700.,
+        };
+        let clamped = Rect {
+            x: 0.,
+            w: 400.,
+            ..target
+        };
+        let mut polls = 0;
+        let mut writes = 0;
+        let mut waits = 0;
+        settle_frame(
+            target,
+            |apply| {
+                polls += 1;
+                writes += usize::from(apply);
+                // The app applies the size later; only the next assignment can place it correctly.
+                Ok(if writes >= 2 && polls >= 6 {
+                    target
+                } else {
+                    clamped
+                })
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(writes, 2);
+        assert_eq!(polls, 10);
+        assert_eq!(waits, 9);
+    }
+
+    #[test]
+    fn resize_corrects_a_frame_that_bounces_back_after_initial_success() {
+        let target = Rect {
+            x: -1000.,
+            y: -800.,
+            w: 1000.,
+            h: 800.,
+        };
+        let old = Rect {
+            x: 0.,
+            y: 0.,
+            w: 500.,
+            h: 400.,
+        };
+        let mut polls = 0;
+        let mut writes = 0;
+        settle_frame(
+            target,
+            |apply| {
+                polls += 1;
+                writes += usize::from(apply);
+                Ok(if polls < 3 || writes >= 2 {
+                    target
+                } else {
+                    old
+                })
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(writes, 2);
+        assert_eq!(polls, 8);
+    }
+
+    #[test]
+    fn resize_bounds_retries_for_size_limits_and_propagates_ax_errors() {
+        let target = Rect {
+            x: 0.,
+            y: 0.,
+            w: 500.,
+            h: 400.,
+        };
+        let mut writes = 0;
+        let mut waits = 0;
+        assert!(settle_frame(
+            target,
+            |apply| {
+                writes += usize::from(apply);
+                Ok(Rect { w: 600., ..target })
+            },
+            || waits += 1
+        )
+        .is_err());
+        assert_eq!(writes, 10);
+        assert_eq!(waits, 29);
+        let error = settle_frame(
+            target,
+            |_| Err("AXPosition: Accessibility error -25205".into()),
+            || panic!("must not retry unsupported attributes"),
+        );
+        assert_eq!(error.unwrap_err(), "AXPosition: Accessibility error -25205");
+    }
+
     #[test]
     fn ax_retries_only_transient_messaging_failures_once() {
         for (errors, expected, timeouts) in [

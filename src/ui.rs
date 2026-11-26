@@ -659,7 +659,7 @@ impl App {
                 self.hide();
                 if let Some(r) = radial {
                     if let Some(layout) = r.selected {
-                        if let Err(e) = resize(r.window.0, layout.rect(r.screen)) {
+                        if let Err(e) = tile(r.window.0, layout, r.origin.0, r.origin.1) {
                             self.toast(&e);
                         }
                     }
@@ -739,6 +739,7 @@ pub unsafe fn run() {
         return;
     }
     if let Some(index) = args.iter().position(|a| a == "--native-check") {
+        let _: () = msg_send![application, finishLaunching];
         let result = args
             .get(index + 1)
             .and_then(|s| s.parse().ok())
