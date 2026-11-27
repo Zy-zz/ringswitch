@@ -4,8 +4,37 @@ use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr::null;
+use std::sync::OnceLock;
 
 pub type Ref = *const c_void;
+
+#[repr(C)]
+pub struct CFRunLoopSourceContext {
+    pub version: isize,
+    pub info: *mut c_void,
+    pub retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    pub release: Option<extern "C" fn(*const c_void)>,
+    pub copy_description: Option<extern "C" fn(*const c_void) -> Ref>,
+    pub equal: Option<extern "C" fn(*const c_void, *const c_void) -> u8>,
+    pub hash: Option<extern "C" fn(*const c_void) -> usize>,
+    pub schedule: Option<extern "C" fn(*mut c_void, Ref, Ref)>,
+    pub cancel: Option<extern "C" fn(*mut c_void, Ref, Ref)>,
+    pub perform: Option<extern "C" fn(*mut c_void)>,
+}
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    pub fn CGContextDrawImage(context: Ref, rect: NSRect, image: Ref);
+    pub fn CGContextSetInterpolationQuality(context: Ref, quality: i32);
+    pub fn CGContextSetAlpha(context: Ref, alpha: f64);
+    pub fn CGContextSaveGState(context: Ref);
+    pub fn CGContextRestoreGState(context: Ref);
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXIsProcessTrusted() -> bool;
@@ -52,8 +81,16 @@ extern "C" {
     fn CFDictionaryGetValue(dictionary: Ref, key: Ref) -> Ref;
     fn CFNumberGetValue(number: Ref, kind: u32, output: *mut c_void) -> bool;
     pub fn CFMachPortCreateRunLoopSource(allocator: Ref, port: Ref, order: isize) -> Ref;
+    pub fn CFRunLoopSourceCreate(
+        allocator: Ref,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> Ref;
+    pub fn CFRunLoopSourceSignal(source: Ref);
     pub fn CFRunLoopGetCurrent() -> Ref;
+    pub fn CFRunLoopGetMain() -> Ref;
     pub fn CFRunLoopAddSource(runloop: Ref, source: Ref, mode: Ref);
+    pub fn CFRunLoopWakeUp(runloop: Ref);
     pub fn CFRunLoopRun();
     pub static kCFRunLoopCommonModes: Ref;
     pub static kCFBooleanFalse: Ref;
@@ -77,6 +114,34 @@ impl PartialEq for Owned {
     fn eq(&self, other: &Self) -> bool {
         unsafe { CFEqual(self.0, other.0) }
     }
+}
+
+/// Thread-safe transfer wrapper for CoreFoundation handles such as AXUIElementRef.
+pub struct SendOwned(pub Owned);
+unsafe impl Send for SendOwned {}
+
+type AxGetWindowFn = unsafe extern "C" fn(Ref, *mut u32) -> i32;
+
+/// Resolve the system's `_AXUIElementGetWindow` symbol once so overlapping or
+/// maximized windows always resolve to their exact CGWindowID for previews.
+unsafe fn ax_window_number(element: Ref) -> Option<u32> {
+    static FN: OnceLock<Option<AxGetWindowFn>> = OnceLock::new();
+    let get_window = *FN.get_or_init(|| {
+        // RTLD_DEFAULT on macOS is (void *)-2.
+        let sym = dlsym((-2isize) as *mut c_void, c"_AXUIElementGetWindow".as_ptr());
+        if sym.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, AxGetWindowFn>(sym))
+        }
+    });
+    let mut id: u32 = 0;
+    if let Some(f) = get_window {
+        if f(element, &mut id) == 0 && id != 0 {
+            return Some(id);
+        }
+    }
+    None
 }
 
 pub unsafe fn ns(s: &str) -> id {
@@ -174,6 +239,7 @@ pub struct Window {
     pub title: String,
     pub minimized: bool,
     pub number: u32,
+    pub rect: Rect,
 }
 
 unsafe fn app_ax(pid: i32) -> Owned {
@@ -237,81 +303,104 @@ pub unsafe fn current_app_windows() -> Result<Vec<Window>, String> {
 }
 
 unsafe fn windows_for(scope: Option<i32>) -> Result<Vec<Window>, String> {
-    // shortcut: public AX only; full enumeration across Spaces would require private macOS APIs.
-    let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-    let apps: id = msg_send![workspace, runningApplications];
-    let count: usize = msg_send![apps, count];
     let mut windows = Vec::new();
-    for i in 0..count {
-        let app: id = msg_send![apps, objectAtIndex:i];
-        let policy: isize = msg_send![app, activationPolicy];
-        let pid: i32 = msg_send![app, processIdentifier];
-        if policy != 0
-            || pid == std::process::id() as i32
-            || scope.is_some_and(|target| pid != target)
-        {
-            continue;
+    let self_pid = std::process::id() as i32;
+    if let Some(pid) = scope {
+        if pid != self_pid {
+            let app: id = msg_send![
+                class!(NSRunningApplication),
+                runningApplicationWithProcessIdentifier:pid
+            ];
+            if app != nil {
+                let policy: isize = msg_send![app, activationPolicy];
+                if policy == 0 {
+                    let name: id = msg_send![app, localizedName];
+                    windows.extend(app_windows(pid, &string(name as Ref))?);
+                }
+            }
         }
-        let name: id = msg_send![app, localizedName];
-        match app_windows(pid, &string(name as Ref)) {
-            Ok(found) => windows.extend(found),
-            Err(error) if scope.is_some() => return Err(error),
-            Err(_) => (),
-        }
-    }
-    // Use public WindowServer bounds to seed front-to-back ordering without private window IDs.
-    if let Some(list) = std::ptr::NonNull::new(CGWindowListCopyWindowInfo(0, 0) as *mut c_void) {
-        let list = Owned(list.as_ptr());
-        let mut ranks = Vec::new();
-        for i in 0..CFArrayGetCount(list.0) {
-            let info = CFArrayGetValueAtIndex(list.0, i);
-            let mut pid = 0i32;
-            let mut layer = 0i32;
-            let p = CFDictionaryGetValue(info, kCGWindowOwnerPID);
-            let l = CFDictionaryGetValue(info, kCGWindowLayer);
-            if p.is_null() || l.is_null() {
+    } else {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let apps: id = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![apps, count];
+        for i in 0..count {
+            let app: id = msg_send![apps, objectAtIndex:i];
+            let policy: isize = msg_send![app, activationPolicy];
+            let pid: i32 = msg_send![app, processIdentifier];
+            if policy != 0 || pid == self_pid {
                 continue;
             }
-            CFNumberGetValue(p, 3, &mut pid as *mut _ as *mut c_void);
-            CFNumberGetValue(l, 3, &mut layer as *mut _ as *mut c_void);
-            let mut r = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
-            if layer == 0
-                && CGRectMakeWithDictionaryRepresentation(
+            let name: id = msg_send![app, localizedName];
+            if let Ok(found) = app_windows(pid, &string(name as Ref)) {
+                windows.extend(found);
+            }
+        }
+    }
+    // Seed front-to-back z-order and fallback CGWindowIDs from WindowServer.
+    if !windows.is_empty() {
+        if let Some(list) = std::ptr::NonNull::new(CGWindowListCopyWindowInfo(0, 0) as *mut c_void)
+        {
+            let list = Owned(list.as_ptr());
+            let mut ranks = Vec::new();
+            for i in 0..CFArrayGetCount(list.0) {
+                let info = CFArrayGetValueAtIndex(list.0, i);
+                let mut pid = 0i32;
+                let p = CFDictionaryGetValue(info, kCGWindowOwnerPID);
+                if p.is_null() {
+                    continue;
+                }
+                CFNumberGetValue(p, 3, &mut pid as *mut _ as *mut c_void);
+                if scope.is_some_and(|target| pid != target) {
+                    continue;
+                }
+                let mut layer = 0i32;
+                let l = CFDictionaryGetValue(info, kCGWindowLayer);
+                if l.is_null() {
+                    continue;
+                }
+                CFNumberGetValue(l, 3, &mut layer as *mut _ as *mut c_void);
+                if layer != 0 {
+                    continue;
+                }
+                let mut r = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
+                if CGRectMakeWithDictionaryRepresentation(
                     CFDictionaryGetValue(info, kCGWindowBounds),
                     &mut r,
-                )
-            {
-                let mut number = 0i32;
-                let n = CFDictionaryGetValue(info, kCGWindowNumber);
-                if !n.is_null() {
-                    CFNumberGetValue(n, 3, &mut number as *mut _ as *mut c_void);
-                }
-                ranks.push(WindowInfo {
-                    pid,
-                    rect: Rect {
-                        x: r.origin.x,
-                        y: r.origin.y,
-                        w: r.size.width,
-                        h: r.size.height,
-                    },
-                    number: number as u32,
-                    title: string(CFDictionaryGetValue(info, kCGWindowName)),
-                });
-            }
-        }
-        for window in &mut windows {
-            if let Some(rect) = frame(window.ax.0) {
-                if let Some(index) = match_window(window.pid, rect, &window.title, &ranks) {
-                    window.number = ranks[index].number;
+                ) {
+                    let mut number = 0i32;
+                    let n = CFDictionaryGetValue(info, kCGWindowNumber);
+                    if !n.is_null() {
+                        CFNumberGetValue(n, 3, &mut number as *mut _ as *mut c_void);
+                    }
+                    ranks.push(WindowInfo {
+                        pid,
+                        rect: Rect {
+                            x: r.origin.x,
+                            y: r.origin.y,
+                            w: r.size.width,
+                            h: r.size.height,
+                        },
+                        number: number as u32,
+                        title: string(CFDictionaryGetValue(info, kCGWindowName)),
+                    });
                 }
             }
+            for window in &mut windows {
+                if window.number == 0 {
+                    if let Some(index) =
+                        match_window(window.pid, window.rect, &window.title, &ranks)
+                    {
+                        window.number = ranks[index].number;
+                    }
+                }
+            }
+            windows.sort_by_key(|w| {
+                ranks
+                    .iter()
+                    .position(|i| i.number == w.number)
+                    .unwrap_or(usize::MAX)
+            });
         }
-        windows.sort_by_key(|w| {
-            ranks
-                .iter()
-                .position(|i| i.number == w.number)
-                .unwrap_or(usize::MAX)
-        });
     }
     Ok(windows)
 }
@@ -352,13 +441,15 @@ unsafe fn app_windows(pid: i32, name: &str) -> Result<Vec<Window>, String> {
             .unwrap_or_default();
         let minimized =
             query_attr(element.0, "AXMinimized")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue));
+        let number = ax_window_number(element.0).unwrap_or(0);
         windows.push(Window {
             ax: element,
             pid,
             app: name.into(),
             title,
             minimized,
-            number: 0,
+            number,
+            rect,
         });
     }
     Ok(windows)
@@ -397,29 +488,67 @@ pub unsafe fn activate(window: &Window) -> Result<(), String> {
 }
 
 pub unsafe fn resize(window: Ref, rect: Rect) -> Result<(), String> {
-    resize_to(window, || Ok(rect))
+    resize_to(window, || Ok(rect), || false)
 }
 
 pub unsafe fn tile(window: Ref, layout: Layout, x: f64, y: f64) -> Result<(), String> {
-    resize_to(window, || {
-        let screen = screen_at(&screens(), x, y).ok_or("没有可用显示器")?;
-        Ok(layout.rect(screen))
-    })
+    tile_with_cancel(window, layout, x, y, || false)
 }
 
-unsafe fn resize_to(window: Ref, target: impl Fn() -> Result<Rect, String>) -> Result<(), String> {
+pub unsafe fn tile_with_cancel(
+    window: Ref,
+    layout: Layout,
+    x: f64,
+    y: f64,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    let pool = NSAutoreleasePool::new(nil);
+    let result = resize_to(
+        window,
+        || {
+            let screen = screen_at(&screens(), x, y).ok_or("没有可用显示器")?;
+            Ok(layout.rect(screen))
+        },
+        cancelled,
+    );
+    pool.drain();
+    result
+}
+
+unsafe fn resize_to(
+    window: Ref,
+    target: impl Fn() -> Result<Rect, String>,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    if cancelled() {
+        return Ok(());
+    }
     if query_attr(window, "AXFullScreen")?.is_some_and(|v| CFEqual(v.0, kCFBooleanTrue)) {
         set(window, "AXFullScreen", kCFBooleanFalse)
             .map_err(|e| format!("无法退出 macOS 全屏：{e}"))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
+            if cancelled() {
+                return Ok(());
+            }
             // AXFullScreen can clear before the Space animation allows resizing.
             std::thread::sleep(std::time::Duration::from_millis(100));
+            if cancelled() {
+                return Ok(());
+            }
             let state =
                 query_attr(window, "AXFullScreen")?.ok_or("无法确认窗口是否已退出 macOS 全屏")?;
-            if CFEqual(state.0, kCFBooleanFalse) && resize_frame(window, target()?).is_ok() {
+            if CFEqual(state.0, kCFBooleanFalse)
+                && resize_frame(window, target()?, &cancelled).is_ok()
+            {
+                if cancelled() {
+                    return Ok(());
+                }
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                if resize_frame(window, target()?).is_ok() {
+                if cancelled() {
+                    return Ok(());
+                }
+                if resize_frame(window, target()?, &cancelled).is_ok() {
                     return Ok(());
                 }
             }
@@ -428,15 +557,19 @@ unsafe fn resize_to(window: Ref, target: impl Fn() -> Result<Rect, String>) -> R
             }
         }
     }
-    resize_frame(window, target()?)
+    resize_frame(window, target()?, &cancelled)
 }
 
-unsafe fn resize_frame(window: Ref, rect: Rect) -> Result<(), String> {
+unsafe fn resize_frame(
+    window: Ref,
+    rect: Rect,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), String> {
     let position = NSPoint::new(rect.x, rect.y);
     let size = NSSize::new(rect.w, rect.h);
     let p = Owned(AXValueCreate(1, &position as *const _ as *const c_void));
     let s = Owned(AXValueCreate(2, &size as *const _ as *const c_void));
-    settle_frame(
+    settle_frame_cancellable(
         rect,
         |apply| {
             if apply {
@@ -449,6 +582,7 @@ unsafe fn resize_frame(window: Ref, rect: Rect) -> Result<(), String> {
             frame_result(window)?.ok_or("无法读取调整后的窗口".into())
         },
         || std::thread::sleep(std::time::Duration::from_millis(50)),
+        cancelled,
     )
 }
 
@@ -459,13 +593,26 @@ fn frame_matches(actual: Rect, target: Rect) -> bool {
         && (actual.h - target.h).abs() <= 4.
 }
 
+#[cfg(test)]
 fn settle_frame(
+    target: Rect,
+    step: impl FnMut(bool) -> Result<Rect, String>,
+    wait: impl FnMut(),
+) -> Result<(), String> {
+    settle_frame_cancellable(target, step, wait, &|| false)
+}
+
+fn settle_frame_cancellable(
     target: Rect,
     mut step: impl FnMut(bool) -> Result<Rect, String>,
     mut wait: impl FnMut(),
+    cancelled: &impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut stable = 0;
     for poll in 0..30 {
+        if cancelled() {
+            return Ok(());
+        }
         let actual = step(stable == 0 && poll % 3 == 0)?;
         stable = if frame_matches(actual, target) {
             stable + 1
@@ -512,6 +659,23 @@ pub unsafe fn screens() -> Vec<(Rect, Rect)> {
         .collect()
 }
 
+pub unsafe fn max_refresh_rate() -> f64 {
+    let array: id = msg_send![class!(NSScreen), screens];
+    let count: usize = msg_send![array, count];
+    let mut max_fps = 60.0f64;
+    for i in 0..count {
+        let screen: id = msg_send![array, objectAtIndex:i];
+        let responds: bool = msg_send![screen, respondsToSelector:sel!(maximumFramesPerSecond)];
+        if responds {
+            let fps: isize = msg_send![screen, maximumFramesPerSecond];
+            if fps > 0 {
+                max_fps = max_fps.max((fps as f64).clamp(60.0, 120.0));
+            }
+        }
+    }
+    max_fps
+}
+
 pub unsafe fn primary_height() -> f64 {
     let array: id = msg_send![class!(NSScreen), screens];
     let first: id = msg_send![array, objectAtIndex:0usize];
@@ -555,6 +719,12 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
             .map(|v| string(v.0))
             .unwrap_or_default();
         if title.starts_with("RingSwitch QA ") {
+            let rect = frame(ax.0).unwrap_or(Rect {
+                x: 0.,
+                y: 0.,
+                w: 480.,
+                h: 360.,
+            });
             fixtures.push(Window {
                 ax,
                 pid,
@@ -562,6 +732,7 @@ pub unsafe fn native_check(pid: i32) -> Result<(), String> {
                 app: "RingSwitch".into(),
                 minimized: false,
                 number: 0,
+                rect,
             });
         }
     }
@@ -804,5 +975,33 @@ mod tests {
         assert_eq!(match_window(1, r, "unknown", &infos), None);
         assert_eq!(match_window(2, r, "first", &infos), None);
         assert_eq!(match_window(1, r, "unknown", &infos[..1]), Some(0));
+    }
+
+    #[test]
+    fn settle_frame_stops_immediately_when_superseded() {
+        let target = Rect {
+            x: 0.,
+            y: 0.,
+            w: 500.,
+            h: 400.,
+        };
+        let polls = std::cell::Cell::new(0);
+        let res = settle_frame_cancellable(
+            target,
+            |_| {
+                polls.set(polls.get() + 1);
+                Ok(Rect { w: 300., ..target })
+            },
+            || {},
+            &|| polls.get() >= 2,
+        );
+        assert!(res.is_ok());
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn ax_window_number_symbol_is_available_on_macos() {
+        let sym = unsafe { dlsym((-2isize) as *mut c_void, c"_AXUIElementGetWindow".as_ptr()) };
+        assert!(!sym.is_null());
     }
 }

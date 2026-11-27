@@ -1,5 +1,6 @@
 #![allow(deprecated, unexpected_cfgs)]
 
+mod anim;
 #[cfg(target_os = "macos")]
 mod capture;
 mod config;

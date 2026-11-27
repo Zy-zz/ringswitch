@@ -13,6 +13,7 @@ use std::sync::{
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Cycle(bool),
+    Navigate(i32, i32),
     CommitSwitch,
     Cancel,
     RadialStart(f64, f64),
@@ -21,6 +22,28 @@ pub enum Command {
     Learned(u32),
     LearnedKey(u32, Shortcut),
     Thumbnail(u64, u32, usize),
+    TileError(String),
+}
+
+#[derive(Clone)]
+pub struct Dispatcher {
+    tx: Sender<Command>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Dispatcher {
+    pub fn new(tx: Sender<Command>, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            tx,
+            wake: Arc::new(wake),
+        }
+    }
+
+    pub fn send(&self, command: Command) -> Result<(), std::sync::mpsc::SendError<Command>> {
+        self.tx.send(command)?;
+        (self.wake)();
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -135,7 +158,13 @@ impl Gesture {
             }
             if self.switching.is_some() && [123, 124, 125, 126].contains(&key) {
                 self.swallow(key);
-                return (true, Some(Command::Cycle(key == 123 || key == 126)));
+                let (dx, dy) = match key {
+                    123 => (-1, 0),
+                    124 => (1, 0),
+                    125 => (0, 1),
+                    _ => (0, -1),
+                };
+                return (true, Some(Command::Navigate(dx, dy)));
             }
             if let Some(s) = config.radial {
                 if modifier(s.key).is_none()
@@ -185,7 +214,7 @@ pub struct Controls {
 }
 struct Hook {
     gesture: Gesture,
-    tx: Sender<Command>,
+    tx: Dispatcher,
     controls: Arc<Controls>,
     tap: Ref,
 }
@@ -228,7 +257,7 @@ extern "C" fn callback(_: Ref, kind: u32, event: Ref, data: *mut c_void) -> Ref 
     }
 }
 
-pub fn start(tx: Sender<Command>, controls: Arc<Controls>) -> Result<(), String> {
+pub fn start(tx: Dispatcher, controls: Arc<Controls>) -> Result<(), String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || unsafe {
         let mut hook = Box::new(Hook {
@@ -379,6 +408,31 @@ mod tests {
                     modifiers: 0
                 }
             ))
+        );
+    }
+    #[test]
+    fn arrow_keys_navigate_switcher_grid() {
+        let mut g = Gesture::default();
+        let c = Config::default();
+        assert_eq!(
+            event(&mut g, 10, 50, OPTION, 0, c, 0).1,
+            Some(Command::Cycle(false))
+        );
+        assert_eq!(
+            event(&mut g, 10, 123, OPTION, 0, c, 0),
+            (true, Some(Command::Navigate(-1, 0)))
+        );
+        assert_eq!(
+            event(&mut g, 10, 124, OPTION, 0, c, 0),
+            (true, Some(Command::Navigate(1, 0)))
+        );
+        assert_eq!(
+            event(&mut g, 10, 125, OPTION, 0, c, 0),
+            (true, Some(Command::Navigate(0, 1)))
+        );
+        assert_eq!(
+            event(&mut g, 10, 126, OPTION, 0, c, 0),
+            (true, Some(Command::Navigate(0, -1)))
         );
     }
 }
