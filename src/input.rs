@@ -5,7 +5,7 @@ use crate::{
 use std::ffi::c_void;
 use std::ptr::null;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::Sender,
     Arc, Mutex,
 };
@@ -14,6 +14,8 @@ use std::sync::{
 pub enum Command {
     Cycle(bool),
     Navigate(i32, i32),
+    SwitchHover(f64, f64),
+    SwitchClick(f64, f64),
     CommitSwitch,
     Cancel,
     RadialStart(f64, f64),
@@ -199,6 +201,12 @@ impl Gesture {
         if (self.held_button.is_some() || self.held_key.is_some()) && (kind == 5 || kind == 27) {
             return (kind == 27, Some(Command::RadialMove(p.0, p.1)));
         }
+        if self.switching.is_some() && kind == 5 {
+            return (false, Some(Command::SwitchHover(p.0, p.1)));
+        }
+        if self.switching.is_some() && kind == 1 {
+            return (false, Some(Command::SwitchClick(p.0, p.1)));
+        }
         (false, None)
     }
     fn swallow(&mut self, key: u16) {
@@ -211,6 +219,7 @@ impl Gesture {
 pub struct Controls {
     pub config: Mutex<Config>,
     pub recording: AtomicU32,
+    pub switching_active: AtomicBool,
 }
 struct Hook {
     gesture: Gesture,
@@ -226,9 +235,18 @@ extern "C" fn callback(_: Ref, kind: u32, event: Ref, data: *mut c_void) -> Ref 
             hook.gesture.switching = None;
             hook.gesture.held_key = None;
             hook.gesture.held_button = None;
+            hook.controls
+                .switching_active
+                .store(false, Ordering::Relaxed);
             let _ = hook.tx.send(Command::Cancel);
             CGEventTapEnable(hook.tap, true);
             return event;
+        }
+        if hook.gesture.switching.is_some()
+            && !hook.controls.switching_active.load(Ordering::Relaxed)
+        {
+            // UI committed/dismissed via mouse click while the modifier was still held.
+            hook.gesture.switching = None;
         }
         let point = CGEventGetLocation(event);
         let (consume, command) = hook.gesture.event(
@@ -241,6 +259,11 @@ extern "C" fn callback(_: Ref, kind: u32, event: Ref, data: *mut c_void) -> Ref 
             hook.controls.recording.load(Ordering::Relaxed),
         );
         if let Some(command) = command {
+            if matches!(command, Command::Cycle(_)) {
+                hook.controls
+                    .switching_active
+                    .store(true, Ordering::Relaxed);
+            }
             if matches!(
                 command,
                 Command::Learned(_) | Command::LearnedKey(..) | Command::Cancel
@@ -266,7 +289,7 @@ pub fn start(tx: Dispatcher, controls: Arc<Controls>) -> Result<(), String> {
             controls,
             tap: null(),
         });
-        let mask = [5, 10, 11, 12, 25, 26, 27]
+        let mask = [1, 5, 10, 11, 12, 25, 26, 27]
             .iter()
             .fold(0u64, |m, k| m | (1 << k));
         hook.tap = CGEventTapCreate(1, 0, 0, mask, callback, &mut *hook as *mut _ as *mut c_void);
@@ -433,6 +456,14 @@ mod tests {
         assert_eq!(
             event(&mut g, 10, 126, OPTION, 0, c, 0),
             (true, Some(Command::Navigate(0, -1)))
+        );
+        assert_eq!(
+            event(&mut g, 5, 0, OPTION, 0, c, 0),
+            (false, Some(Command::SwitchHover(10., 10.)))
+        );
+        assert_eq!(
+            event(&mut g, 1, 0, OPTION, 0, c, 0),
+            (false, Some(Command::SwitchClick(10., 10.)))
         );
     }
 }

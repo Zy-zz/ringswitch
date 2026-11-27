@@ -12,7 +12,7 @@ use objc::{
     class,
     declare::ClassDecl,
     msg_send,
-    runtime::{Class, Object, Sel},
+    runtime::{Class, Object, Sel, BOOL},
     sel, sel_impl,
 };
 use std::f64::consts::PI;
@@ -22,7 +22,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -165,6 +165,8 @@ struct App {
     switcher_alpha: Spring,
     switcher_sel_rect: SpringRect,
     switcher_has_sel: bool,
+    switcher_open_mouse: Option<(f64, f64)>,
+    switcher_mouse_armed: bool,
     grid: (usize, usize),
     session: u64,
     thumbnails: HashMap<u32, CachedThumb>,
@@ -265,10 +267,41 @@ unsafe fn mono_digit_font(size: f64, weight: f64) -> id {
     msg_send![class!(NSFont), monospacedDigitSystemFontOfSize:size weight:weight]
 }
 
-unsafe fn draw_text_single_line(s: &str, r: NSRect, font: id, c: id, align: usize) {
+unsafe fn measure_text_size(s: &str, font: id) -> NSSize {
+    let attrs: id = msg_send![class!(NSDictionary), dictionaryWithObject:font forKey:ns("NSFont")];
+    msg_send![ns(s), sizeWithAttributes:attrs]
+}
+
+unsafe fn measure_text(s: &str, font: id) -> f64 {
+    measure_text_size(s, font).width.ceil()
+}
+
+/// Draw single-line text centered both horizontally and vertically inside `box_r`.
+/// Uses `drawAtPoint:` so it is completely immune to arm64 vs x86_64 NSTextAlignment ABI differences.
+unsafe fn draw_text_centered(s: &str, box_r: NSRect, font: id, c: id) {
+    let sz = measure_text_size(s, font);
+    let keys = [ns("NSFont"), ns("NSColor")];
+    let values = [font, c];
+    let attrs: id = msg_send![
+        class!(NSDictionary),
+        dictionaryWithObjects:values.as_ptr()
+        forKeys:keys.as_ptr()
+        count:2usize
+    ];
+    let pt = NSPoint::new(
+        (box_r.origin.x + (box_r.size.width - sz.width) * 0.5).round(),
+        (box_r.origin.y + (box_r.size.height - sz.height) * 0.5).round(),
+    );
+    let _: () = msg_send![ns(s), drawAtPoint:pt withAttributes:attrs];
+}
+
+/// Draw single-line left-aligned text vertically centered on `mid_y`, truncating with ellipsis at `max_w`.
+unsafe fn draw_text_left(s: &str, x: f64, mid_y: f64, max_w: f64, font: id, c: id) {
+    let sz = measure_text_size(s, font);
+    let h = sz.height.ceil();
     let style: id = msg_send![class!(NSMutableParagraphStyle), new];
     let _: () = msg_send![style, setLineBreakMode:4usize]; // NSLineBreakByTruncatingTail
-    let _: () = msg_send![style, setAlignment:align];
+    let _: () = msg_send![style, setAlignment:0usize]; // NSTextAlignmentLeft == 0 on all architectures
     let keys = [ns("NSFont"), ns("NSColor"), ns("NSParagraphStyle")];
     let values = [font, c, style];
     let attrs: id = msg_send![
@@ -277,15 +310,9 @@ unsafe fn draw_text_single_line(s: &str, r: NSRect, font: id, c: id, align: usiz
         forKeys:keys.as_ptr()
         count:3usize
     ];
-    // NSStringDrawingUsesLineFragmentOrigin (1) | NSStringDrawingTruncatesLastVisibleLine (32)
+    let r = rect(x, (mid_y - h * 0.5).round(), max_w.max(1.0), h);
     let _: () = msg_send![ns(s), drawWithRect:r options:33usize attributes:attrs];
     let _: () = msg_send![style, release];
-}
-
-unsafe fn measure_text(s: &str, font: id) -> f64 {
-    let attrs: id = msg_send![class!(NSDictionary), dictionaryWithObject:font forKey:ns("NSFont")];
-    let size: NSSize = msg_send![ns(s), sizeWithAttributes:attrs];
-    size.width.ceil()
 }
 
 unsafe fn draw_cached_icon(icon_img: id, r: NSRect) {
@@ -385,6 +412,45 @@ fn card_frame_in_switcher(position: usize, cols: usize, view_h: f64) -> Rect {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchHit {
+    Card(usize),
+    Page(usize),
+}
+
+fn switcher_hit_test(
+    pt: (f64, f64),
+    view_w: f64,
+    view_h: f64,
+    grid: (usize, usize),
+    selected: usize,
+    total_windows: usize,
+) -> Option<SwitchHit> {
+    let capacity = (grid.0 * grid.1).max(1);
+    let start = selected / capacity * capacity;
+    let visible = total_windows.saturating_sub(start).min(capacity);
+    for position in 0..visible {
+        let cf = card_frame_in_switcher(position, grid.0, view_h);
+        if pt.0 >= cf.x && pt.0 <= cf.x + cf.w && pt.1 >= cf.y && pt.1 <= cf.y + cf.h {
+            return Some(SwitchHit::Card(start + position));
+        }
+    }
+    let pages = total_windows.div_ceil(capacity);
+    if pages > 1 && pt.1 >= 2.0 && pt.1 <= 26.0 {
+        let current_page = selected / capacity;
+        let total_w = (pages as f64 - 1.0) * 12.0 + 16.0;
+        let mut dx = (view_w - total_w) * 0.5;
+        for p in 0..pages {
+            let dw = if p == current_page { 16.0 } else { 5.5 };
+            if pt.0 >= dx - 4.0 && pt.0 <= dx + dw + 4.0 {
+                return Some(SwitchHit::Page(p));
+            }
+            dx += dw + 6.5;
+        }
+    }
+    None
+}
+
 unsafe fn draw_switcher(app: &App, view: id, b: NSRect) {
     let dark = is_dark_view(view);
     let (ar, ag, ab) = accent_rgb();
@@ -409,7 +475,7 @@ unsafe fn draw_switcher(app: &App, view: id, b: NSRect) {
         return;
     }
 
-    // Header: App icon + Semibold app name + tabular count capsule + subtle shortcut hint.
+    // Header: App icon + Semibold app name + perfectly centered count pill + subtle shortcut hint.
     let heading = app
         .windows
         .first()
@@ -419,56 +485,54 @@ unsafe fn draw_switcher(app: &App, view: id, b: NSRect) {
     if let Some((_, icon_img)) = app.app_icon {
         draw_cached_icon(icon_img, rect(20.0, header_mid_y - 12.0, 24.0, 24.0));
     }
-    let heading_font = font_weight(15.0, 0.23); // Semibold
-    let heading_w = measure_text(heading, heading_font).min(b.size.width - 210.0);
-    draw_text_single_line(
-        heading,
-        rect(52.0, header_mid_y - 10.5, heading_w + 4.0, 21.0),
-        heading_font,
-        label_c,
-        0,
-    );
 
-    // Count pill right next to the app title.
+    // Measure count pill first so app heading never overlaps it at any panel width.
     let count_str = format!("{} / {}", app.selected + 1, app.windows.len());
     let count_font = mono_digit_font(11.5, 0.15);
-    let count_w = measure_text(&count_str, count_font) + 14.0;
-    let pill_x = 58.0 + heading_w;
-    let pill_bg = if dark {
-        color(1.0, 1.0, 1.0, 0.10)
-    } else {
-        color(0.0, 0.0, 0.0, 0.06)
-    };
-    fill(
-        rect(pill_x, header_mid_y - 10.0, count_w, 20.0),
-        pill_bg,
-        10.0,
-    );
-    draw_text_single_line(
-        &count_str,
-        rect(pill_x, header_mid_y - 8.5, count_w, 17.0),
-        count_font,
-        secondary_c,
-        2, // center
+    let count_sz = measure_text_size(&count_str, count_font);
+    let pill_w = (count_sz.width.ceil() + 16.0).max(38.0);
+    let pill_h = 20.0;
+
+    let heading_font = font_weight(15.0, 0.23); // Semibold
+    let max_heading_w = (b.size.width - 116.0 - pill_w).max(48.0);
+    let heading_w = measure_text(heading, heading_font).min(max_heading_w);
+    draw_text_left(
+        heading,
+        52.0,
+        header_mid_y,
+        heading_w + 2.0,
+        heading_font,
+        label_c,
     );
 
-    // Subtle shortcut hint on the right side (before the ? button).
+    let pill_x = (52.0 + heading_w + 10.0).round();
+    let pill_r = rect(
+        pill_x,
+        (header_mid_y - pill_h * 0.5).round(),
+        pill_w,
+        pill_h,
+    );
+    let pill_bg = if dark {
+        color(1.0, 1.0, 1.0, 0.11)
+    } else {
+        color(0.0, 0.0, 0.0, 0.065)
+    };
+    fill(pill_r, pill_bg, pill_h * 0.5);
+    draw_text_centered(&count_str, pill_r, count_font, secondary_c);
+
+    // Subtle shortcut hint on the right side (only when there is clean breathing room).
     let hold_label = app.controls.config.lock().unwrap().switch.label();
-    let hint = format!("{hold_label} 切换 · ⇧ 反向");
+    let hint = format!("{hold_label} 切换 · 鼠标可点选");
     let hint_font = font_weight(11.0, 0.0);
-    let hint_w = measure_text(&hint, hint_font);
-    if b.size.width - (pill_x + count_w) > hint_w + 60.0 {
-        draw_text_single_line(
+    let hint_sz = measure_text_size(&hint, hint_font);
+    let hint_w = hint_sz.width.ceil();
+    let hint_x = b.size.width - 46.0 - hint_w;
+    if hint_x >= pill_x + pill_w + 18.0 {
+        draw_text_centered(
             &hint,
-            rect(
-                b.size.width - 46.0 - hint_w,
-                header_mid_y - 8.0,
-                hint_w + 2.0,
-                16.0,
-            ),
+            rect(hint_x, (header_mid_y - 9.0).round(), hint_w, 18.0),
             hint_font,
             tertiary_c,
-            1, // right
         );
     }
 
@@ -627,24 +691,20 @@ unsafe fn draw_switcher(app: &App, view: id, b: NSRect) {
             } else {
                 "窗口预览"
             };
-            let sw = measure_text(status_text, badge_font) + 14.0;
+            let sw = measure_text(status_text, badge_font) + 16.0;
+            let badge_r = rect(
+                (prev_x + (prev_w - sw) * 0.5).round(),
+                prev_y + 14.0,
+                sw,
+                20.0,
+            );
             let badge_bg = if dark {
                 color(1.0, 1.0, 1.0, 0.09)
             } else {
                 color(0.0, 0.0, 0.0, 0.06)
             };
-            fill(
-                rect(prev_x + (prev_w - sw) * 0.5, prev_y + 14.0, sw, 19.0),
-                badge_bg,
-                9.5,
-            );
-            draw_text_single_line(
-                status_text,
-                rect(prev_x + (prev_w - sw) * 0.5, prev_y + 15.5, sw, 16.0),
-                badge_font,
-                secondary_c,
-                2,
-            );
+            fill(badge_r, badge_bg, 10.0);
+            draw_text_centered(status_text, badge_r, badge_font, secondary_c);
         }
 
         // Card footer title (with subtle current-window dot for index 0).
@@ -655,22 +715,24 @@ unsafe fn draw_switcher(app: &App, view: id, b: NSRect) {
         };
         let mut tx = cf.x + 12.0;
         let mut tw = cf.w - 24.0;
+        let footer_mid_y = cf.y + 19.0;
         if index == 0 {
             let dot_c = color(ar, ag, ab, if is_selected { 0.95 } else { 0.65 });
-            fill(rect(tx, cf.y + 16.5, 6.0, 6.0), dot_c, 3.0);
+            fill(rect(tx, footer_mid_y - 3.0, 6.0, 6.0), dot_c, 3.0);
             tx += 11.0;
             tw -= 11.0;
         }
-        draw_text_single_line(
+        draw_text_left(
             title_str,
-            rect(tx, cf.y + 10.5, tw, 18.0),
+            tx,
+            footer_mid_y,
+            tw,
             if is_selected {
                 title_sel_font
             } else {
                 title_font
             },
             if is_selected { label_c } else { secondary_c },
-            0,
         );
     }
 
@@ -957,13 +1019,7 @@ unsafe fn draw_preview(app: &App, view: id, b: NSRect) {
                 fg,
                 color(ar, ag, ab, 0.92),
             );
-            draw_text_single_line(
-                label,
-                rect(px + 38.0, py + (pill_h - 18.0) * 0.5, tw + 4.0, 18.0),
-                font,
-                fg,
-                0,
-            );
+            draw_text_left(label, px + 38.0, py + pill_h * 0.5, tw + 4.0, font, fg);
         }
     }
 }
@@ -986,18 +1042,36 @@ unsafe fn draw_toast(app: &App, view: id, b: NSRect) {
         4.0,
     );
     let font = font_weight(13.5, 0.18);
-    draw_text_single_line(
+    draw_text_left(
         &app.message,
-        rect(
-            34.0,
-            (b.size.height - 19.0) * 0.5,
-            b.size.width - 50.0,
-            19.0,
-        ),
+        34.0,
+        b.size.height * 0.5,
+        b.size.width - 50.0,
         font,
         label_c,
-        0,
     );
+}
+
+extern "C" fn accepts_first_mouse(_: &Object, _: Sel, _: id) -> BOOL {
+    YES
+}
+
+extern "C" fn mouse_down(view: &Object, _: Sel, event: id) {
+    unsafe {
+        APP.with(|cell| {
+            let Ok(mut app) = cell.try_borrow_mut() else {
+                return;
+            };
+            let Some(app) = app.as_mut() else { return };
+            let view_ptr = view as *const Object as id;
+            if !std::ptr::eq(view_ptr, app.switcher_view) || !app.switching || app.hooked {
+                return;
+            }
+            let loc: NSPoint = msg_send![event, locationInWindow];
+            let pt: NSPoint = msg_send![view, convertPoint:loc fromView:nil];
+            app.click_switcher_local(pt.x, pt.y);
+        });
+    }
 }
 
 extern "C" fn draw(view: &Object, _: Sel, _: NSRect) {
@@ -1257,10 +1331,10 @@ impl App {
         if commands.is_empty() {
             return;
         }
-        // Coalesce high-frequency mouse motion so high-polling mice never delay button release.
+        // Coalesce high-frequency mouse motion so high-polling mice never delay releases/clicks.
         let mut motion = None;
         for command in commands {
-            if matches!(command, Command::RadialMove(..)) {
+            if matches!(command, Command::RadialMove(..) | Command::SwitchHover(..)) {
                 motion = Some(command);
                 continue;
             }
@@ -1564,6 +1638,11 @@ impl App {
 
     unsafe fn hide_switcher(&mut self) {
         self.switching = false;
+        self.controls
+            .switching_active
+            .store(false, Ordering::Relaxed);
+        self.switcher_open_mouse = None;
+        self.switcher_mouse_armed = false;
         self.in_flight.clear();
         let _: () = msg_send![self.help_popover, close];
         let _: () = msg_send![self.switcher_panel, setIgnoresMouseEvents:YES];
@@ -1715,7 +1794,7 @@ impl App {
             let hold = self.controls.config.lock().unwrap().switch.label();
             let _: () = msg_send![
                 self.help,
-                setToolTip:ns(&format!("{hold} · 松开修饰键切换 · Shift 反向 · 方向键选择 · Esc 取消"))
+                setToolTip:ns(&format!("{hold} · 松开修饰键或点击卡片切换 · 鼠标悬停/方向键选择 · Esc 取消"))
             ];
             let x = s.x + (s.w - w) * 0.5;
             let y = s.y + (s.h - h) * 0.5;
@@ -1789,6 +1868,115 @@ impl App {
         }
     }
 
+    unsafe fn commit_switch(&mut self) {
+        if self.switching {
+            let selected = self.windows.get(self.selected).cloned();
+            self.hide_switcher();
+            if let Some(w) = selected {
+                match activate(&w) {
+                    Ok(()) => {
+                        self.mru.retain(|m| m != &w.ax);
+                        self.mru.insert(0, w.ax);
+                    }
+                    Err(e) => self.toast(&e),
+                }
+            }
+        }
+    }
+
+    unsafe fn hover_switcher(&mut self, screen_x: f64, screen_y: f64) {
+        if !self.switching || !self.switcher_visible || self.windows.is_empty() {
+            return;
+        }
+        if !self.switcher_mouse_armed {
+            match self.switcher_open_mouse {
+                Some((ox, oy)) if (screen_x - ox).hypot(screen_y - oy) < 6.0 => return,
+                None => {
+                    self.switcher_open_mouse = Some((screen_x, screen_y));
+                    return;
+                }
+                _ => {
+                    self.switcher_mouse_armed = true;
+                }
+            }
+        }
+        let panel_frame: NSRect = msg_send![self.switcher_panel, frame];
+        let cocoa_y = primary_height() - screen_y;
+        let lx = screen_x - panel_frame.origin.x;
+        let ly = cocoa_y - panel_frame.origin.y;
+        if let Some(SwitchHit::Card(index)) = switcher_hit_test(
+            (lx, ly),
+            panel_frame.size.width,
+            panel_frame.size.height,
+            self.grid,
+            self.selected,
+            self.windows.len(),
+        ) {
+            if index != self.selected {
+                self.selected = index;
+                let capacity = (self.grid.0 * self.grid.1).max(1);
+                let sel_pos = self.selected % capacity;
+                let target = card_frame_in_switcher(sel_pos, self.grid.0, panel_frame.size.height);
+                self.switcher_sel_rect.set_target(target);
+                let _: () = msg_send![self.switcher_view, setNeedsDisplay:YES];
+                self.ensure_anim_timer();
+            }
+        }
+    }
+
+    unsafe fn click_switcher_screen(&mut self, screen_x: f64, screen_y: f64) {
+        if !self.switching || !self.switcher_visible || self.windows.is_empty() {
+            return;
+        }
+        let panel_frame: NSRect = msg_send![self.switcher_panel, frame];
+        let cocoa_y = primary_height() - screen_y;
+        let lx = screen_x - panel_frame.origin.x;
+        let ly = cocoa_y - panel_frame.origin.y;
+        if lx < 0.0 || ly < 0.0 || lx > panel_frame.size.width || ly > panel_frame.size.height {
+            // Clicking outside the switcher panel dismisses it cleanly.
+            self.hide_switcher();
+            return;
+        }
+        self.click_switcher_local(lx, ly);
+    }
+
+    unsafe fn click_switcher_local(&mut self, lx: f64, ly: f64) {
+        if !self.switching || self.windows.is_empty() {
+            return;
+        }
+        let bounds: NSRect = msg_send![self.switcher_view, bounds];
+        match switcher_hit_test(
+            (lx, ly),
+            bounds.size.width,
+            bounds.size.height,
+            self.grid,
+            self.selected,
+            self.windows.len(),
+        ) {
+            Some(SwitchHit::Card(index)) => {
+                self.selected = index;
+                if self.demo {
+                    let capacity = (self.grid.0 * self.grid.1).max(1);
+                    let sel_pos = self.selected % capacity;
+                    let target = card_frame_in_switcher(sel_pos, self.grid.0, bounds.size.height);
+                    self.switcher_sel_rect.snap(target);
+                    let _: () = msg_send![self.switcher_view, setNeedsDisplay:YES];
+                } else {
+                    self.commit_switch();
+                }
+            }
+            Some(SwitchHit::Page(page)) => {
+                let capacity = (self.grid.0 * self.grid.1).max(1);
+                let next = (page * capacity).min(self.windows.len().saturating_sub(1));
+                if next != self.selected {
+                    self.selected = next;
+                    self.show_switcher(false, true);
+                }
+            }
+            None => (),
+        }
+    }
+
     unsafe fn command(&mut self, command: Command) {
         match command {
             Command::Cycle(backwards) => {
@@ -1825,6 +2013,12 @@ impl App {
                     }
                     self.selected = 0;
                     self.switching = true;
+                    self.controls
+                        .switching_active
+                        .store(true, Ordering::Relaxed);
+                    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+                    self.switcher_open_mouse = Some((mouse.x, primary_height() - mouse.y));
+                    self.switcher_mouse_armed = false;
                     newly_opened = true;
                 }
                 self.selected = cycle(self.selected, self.windows.len(), backwards);
@@ -1848,20 +2042,14 @@ impl App {
                 let new_page = self.selected / capacity;
                 self.show_switcher(false, new_page != prev_page);
             }
+            Command::SwitchHover(x, y) => {
+                self.hover_switcher(x, y);
+            }
+            Command::SwitchClick(x, y) => {
+                self.click_switcher_screen(x, y);
+            }
             Command::CommitSwitch => {
-                if self.switching {
-                    let selected = self.windows.get(self.selected).cloned();
-                    self.hide_switcher();
-                    if let Some(w) = selected {
-                        match activate(&w) {
-                            Ok(()) => {
-                                self.mru.retain(|m| m != &w.ax);
-                                self.mru.insert(0, w.ax);
-                            }
-                            Err(e) => self.toast(&e),
-                        }
-                    }
-                }
+                self.commit_switch();
             }
             Command::Cancel => {
                 self.controls.recording.store(0, Ordering::Relaxed);
@@ -2283,6 +2471,14 @@ pub unsafe fn run() {
 
     let mut view_decl = ClassDecl::new("RingSwitchCanvas", class!(NSView)).unwrap();
     view_decl.add_method(sel!(drawRect:), draw as extern "C" fn(&Object, Sel, NSRect));
+    view_decl.add_method(
+        sel!(acceptsFirstMouse:),
+        accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
+    );
+    view_decl.add_method(
+        sel!(mouseDown:),
+        mouse_down as extern "C" fn(&Object, Sel, id),
+    );
     let view_class = view_decl.register();
 
     let mut delegate_decl = ClassDecl::new("RingSwitchDelegate", class!(NSObject)).unwrap();
@@ -2305,6 +2501,7 @@ pub unsafe fn run() {
     // 4 dedicated panels: Switcher, Radial Halo, Target Preview, and Toast Pill.
     let (switcher_panel, switcher_view) =
         make_glass_panel(view_class, 540.0, 260.0, 28.0, 25, false, true);
+    let _: () = msg_send![switcher_panel, setBecomesKeyOnlyIfNeeded:YES];
     let (radial_panel, radial_glass, radial_view) = make_radial_panel(view_class);
     let (preview_panel, preview_view) =
         make_glass_panel(view_class, 400.0, 300.0, 18.0, 24, true, false);
@@ -2430,6 +2627,7 @@ pub unsafe fn run() {
         controls: Arc::new(Controls {
             config: Mutex::new(Config::load()),
             recording: AtomicU32::new(0),
+            switching_active: AtomicBool::new(false),
         }),
         rx,
         tx,
@@ -2445,6 +2643,8 @@ pub unsafe fn run() {
         switcher_alpha: Spring::new(0.0),
         switcher_sel_rect: SpringRect::new(zero_rect),
         switcher_has_sel: false,
+        switcher_open_mouse: None,
+        switcher_mouse_armed: false,
         grid: (1, 1),
         session: 0,
         thumbnails: HashMap::new(),
@@ -2605,4 +2805,48 @@ pub unsafe fn run() {
     let _: () = msg_send![application, run];
     CFRelease(wake_source_ref);
     pool.drain();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switcher_hit_test_finds_cards_and_page_dots() {
+        let cols = 3;
+        let rows = 2;
+        let w = SWITCHER_PAD_X * 2.0 + cols as f64 * CARD_W + (cols - 1) as f64 * CARD_GAP_X;
+        let h = SWITCHER_HEADER_H
+            + rows as f64 * CARD_H
+            + (rows - 1) as f64 * CARD_GAP_Y
+            + SWITCHER_PAD_BOTTOM
+            + SWITCHER_DOTS_H;
+        let c0 = card_frame_in_switcher(0, cols, h);
+        let c4 = card_frame_in_switcher(4, cols, h);
+        assert_eq!(
+            switcher_hit_test((c0.x + 20.0, c0.y + 20.0), w, h, (cols, rows), 0, 8),
+            Some(SwitchHit::Card(0))
+        );
+        assert_eq!(
+            switcher_hit_test((c4.x + 50.0, c4.y + 50.0), w, h, (cols, rows), 0, 8),
+            Some(SwitchHit::Card(4))
+        );
+        // Header area must not hit any card so the ? help button receives clicks cleanly.
+        assert_eq!(
+            switcher_hit_test((w - 28.0, h - 24.0), w, h, (cols, rows), 0, 8),
+            None
+        );
+        // Page dots at bottom center for 2 pages (8 windows, capacity 6).
+        let total_w = 12.0 + 16.0;
+        let first_dot_x = (w - total_w) * 0.5 + 8.0;
+        let second_dot_x = (w - total_w) * 0.5 + 16.0 + 6.5 + 2.5;
+        assert_eq!(
+            switcher_hit_test((first_dot_x, 14.0), w, h, (cols, rows), 0, 8),
+            Some(SwitchHit::Page(0))
+        );
+        assert_eq!(
+            switcher_hit_test((second_dot_x, 14.0), w, h, (cols, rows), 0, 8),
+            Some(SwitchHit::Page(1))
+        );
+    }
 }
